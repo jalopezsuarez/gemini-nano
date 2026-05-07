@@ -242,7 +242,22 @@ ignora `apiBase` y manda la petición a `generativelanguage.googleapis.com`
   model: gemini-nano
   apiBase: http://localhost:8765/v1
   apiKey: sk-anything   # cualquier string; el proxy no valida la cabecera
+  defaultCompletionOptions:
+    contextLength: 4096   # Nano tiene ~6k; deja margen para la respuesta
+    maxTokens: 512
 ```
+
+Si te sale **`Input too large for Gemini Nano context, even after trimming
+history.`**, significa que el último mensaje (instrucciones + contexto del
+archivo + pregunta) que envía Continue ya supera por sí solo los ~6k tokens
+de Nano. El proxy ya recorta la historia automáticamente (ver *Auto-trim*),
+pero no toca el último user. Soluciones:
+
+- **Bajar `contextLength`** en el bloque del modelo (snippet de arriba) —
+  Continue dejará de meter tanto contexto extra.
+- **Desactivar context providers pesados** (Settings → *Context Providers*):
+  `@codebase`, `@folder`, etc. añaden mucho texto al prompt.
+- **Acortar el system prompt / reglas custom** que tengas en `config.yaml`.
 
 Mismo principio para Cursor, Zed, ChatGPT-Next-Web, LiteLLM… elige el
 provider **OpenAI-compatible** y apunta `baseURL` a `http://localhost:8765/v1`.
