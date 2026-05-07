@@ -464,6 +464,104 @@ function sanitizeContinueToolBlocks(text, validNames) {
   return { text: out, replaced };
 }
 
+// Heurísticas para clasificar tools por intención y detectar delegación.
+const READ_TOOL_HINTS = ['read', 'open', 'view', 'show', 'ls', 'list', 'glob', 'grep', 'search', 'fetch'];
+const EDIT_TOOL_HINTS = ['write', 'edit', 'apply', 'create', 'modify', 'update', 'patch', 'replace', 'insert', 'delete'];
+
+function classifyToolNames(validNames) {
+  const reads = [];
+  const edits = [];
+  for (const n of validNames) {
+    const lc = n.toLowerCase();
+    if (EDIT_TOOL_HINTS.some((h) => lc.includes(h))) edits.push(n);
+    else if (READ_TOOL_HINTS.some((h) => lc.includes(h))) reads.push(n);
+  }
+  return { reads, edits };
+}
+
+function buildContinueReinforcement(validNames) {
+  const { reads, edits } = classifyToolNames(validNames);
+  if (!reads.length && !edits.length) return null;
+
+  const lines = [
+    '',
+    '────────────',
+    'CRITICAL TOOL-USE BEHAVIOR (read carefully):',
+  ];
+  if (reads.length) {
+    const r = reads.includes('read_currently_open_file') ? 'read_currently_open_file' : reads[0];
+    const r2 = reads.find((n) => /^read[_-]?file/i.test(n)) || reads[0];
+    lines.push(
+      `- NEVER ask the user to paste, share, copy, or "provide the contents" of a file. You have tools to read files yourself.`,
+      `- If the user mentions a file by name or extension (e.g. "index.html", "style.css", "the file"), call ${r2 === r ? `\`${r}\`` : `\`${r2}\` (or \`${r}\` if no path was given)`} immediately. Do not explain first.`,
+      `- The very first tool call when the user references a file MUST be a read tool. Use one of: ${reads.join(', ')}.`,
+    );
+  }
+  if (edits.length) {
+    const w = edits.find((n) => /^(write|edit|create|apply)/i.test(n)) || edits[0];
+    lines.push(
+      `- To modify or create a file, call \`${w}\` directly with the new content. Do NOT print the new file in a markdown code block and ask the user to copy it.`,
+      `- Edit tools available: ${edits.join(', ')}.`,
+    );
+  } else {
+    lines.push(
+      `- You do NOT have any edit tools right now (you may be in read-only / Plan mode). If the user asks for changes, tell them: "I can read the file, but to apply edits switch Continue to Agent mode." Do not invent an edit tool.`,
+    );
+  }
+  lines.push('────────────', '');
+  return lines.join('\n');
+}
+
+const DELEGATION_PHRASES_RE = /\b(?:please|could you|can you|kindly|would you)?\s*(?:paste|share|copy|provide|send|upload|attach)\b/i;
+const DELEGATION_NEED_TO_SEE_RE = /\b(?:I\s+(?:need|have)\s+to\s+(?:see|look at|know|read)|let me see|show me|give me|I'?ll need|before I can|first,? I need)\b/i;
+const DELEGATION_ONCE_YOU_RE = /\b(?:once you (?:paste|share|provide)|after you (?:paste|share|provide)|when you (?:paste|share|provide))\b/i;
+
+function looksLikeDelegation(text) {
+  if (!text) return false;
+  return (
+    DELEGATION_PHRASES_RE.test(text) ||
+    DELEGATION_NEED_TO_SEE_RE.test(text) ||
+    DELEGATION_ONCE_YOU_RE.test(text)
+  );
+}
+
+function hasToolBlock(text) {
+  return /```tool\b/.test(text || '');
+}
+
+function buildDelegationCorrection(validNames, lastUserContent) {
+  const { reads, edits } = classifyToolNames(validNames);
+  const readTool = reads.find((n) => /^read[_-]?file/i.test(n)) || reads[0] || null;
+  const openTool = reads.includes('read_currently_open_file') ? 'read_currently_open_file' : null;
+
+  const lines = [
+    'Your previous response asked the user to paste/share file contents. That is wrong: you HAVE tools to read files yourself.',
+    `Tools available now: ${[...validNames].join(', ')}.`,
+  ];
+  if (openTool && readTool && openTool !== readTool) {
+    lines.push(
+      `Use \`${openTool}\` if no path is given, or \`${readTool}\` with the path the user mentioned.`,
+    );
+  } else if (readTool) {
+    lines.push(`Use \`${readTool}\` to read it. If you don't know the path, ask only for the path (a single short question), do not ask for the contents.`);
+  }
+  if (edits.length) {
+    lines.push(`To modify a file, after reading it, call ${edits[0]} with the new content.`);
+  }
+  lines.push(
+    `Now retry. Respond with EXACTLY one tool block, in this format and nothing else (no prose around it):`,
+    '```tool',
+    `TOOL_NAME: ${readTool || (reads[0] || 'TOOL_NAME')}`,
+    'BEGIN_ARG: <argname>',
+    '<value>',
+    'END_ARG',
+    '```',
+    '',
+    `The user's previous message was: "${(lastUserContent || '').slice(0, 240)}"`,
+  );
+  return lines.join('\n');
+}
+
 // Detecta el "input too large" de la Prompt API (varía un poco entre builds).
 const TOO_LARGE_RE = /too large|exceed|context|quota|QuotaExceeded/i;
 function isTooLargeError(err) {
@@ -745,7 +843,7 @@ async function handleChatCompletions(req, res) {
       },
     });
   }
-  const fittedOpts = fitted.opts;
+  let fittedOpts = fitted.opts;
   if (fitted.trimmedCount > 0) {
     res.setHeader('X-Gemini-Trimmed-Messages', String(fitted.trimmedCount));
   }
@@ -826,20 +924,64 @@ async function handleChatCompletions(req, res) {
   // de fallar.
   const systemToolNames = extractToolNamesFromSystem(fittedOpts.initialPrompts || []);
   if (systemToolNames.size > 0) {
+    // Refuerzo: añadimos al system una nota muy explícita prohibiendo
+    // delegar al usuario y forzando el uso de la tool de lectura. Esto
+    // sube mucho la tasa de éxito con modelos pequeños como Nano.
+    const reinforcement = buildContinueReinforcement(systemToolNames);
+    if (reinforcement) {
+      const ip = (fittedOpts.initialPrompts || []).slice();
+      const sysIdx = ip.findIndex((m) => m.role === 'system');
+      if (sysIdx >= 0) {
+        ip[sysIdx] = { role: 'system', content: ip[sysIdx].content + '\n\n' + reinforcement };
+      } else {
+        ip.unshift({ role: 'system', content: reinforcement });
+      }
+      fittedOpts = { ...fittedOpts, initialPrompts: ip };
+    }
+
     let text;
+    let trimmedCount = 0;
     try {
       const r = await runPromptWithFit(fittedOpts, lastForNano.content);
       text = r.text || '';
-      if (r.trimmedCount > 0) {
-        const prev = parseInt(res.getHeader('X-Gemini-Trimmed-Messages') || '0', 10);
-        res.setHeader('X-Gemini-Trimmed-Messages', String(prev + r.trimmedCount));
-      }
+      trimmedCount = r.trimmedCount || 0;
     } catch (e) {
       if (e?.code === 'INPUT_TOO_LARGE' || isTooLargeError(e)) {
         return sendError(res, 413, 'Input too large for Gemini Nano context, even after trimming history.', 'context_length_exceeded');
       }
       return sendError(res, 500, e.message, 'server_error');
     }
+
+    // Reintento correctivo: si Nano contestó pidiendo al usuario el contenido
+    // del archivo en vez de usar la tool, le damos UNA segunda oportunidad
+    // con un mensaje correctivo claro.
+    let retried = false;
+    if (!hasToolBlock(text) && looksLikeDelegation(text)) {
+      const { reads } = classifyToolNames(systemToolNames);
+      if (reads.length) {
+        try {
+          const correction = buildDelegationCorrection(systemToolNames, lastForNano.content);
+          const ip2 = (fittedOpts.initialPrompts || []).slice();
+          ip2.push({ role: 'assistant', content: text });
+          const r2 = await runPromptWithFit({ ...fittedOpts, initialPrompts: ip2 }, correction);
+          if (r2.text) {
+            text = r2.text;
+            trimmedCount += r2.trimmedCount || 0;
+            retried = true;
+            console.warn('[tools-in-system] reintento correctivo aplicado (delegación detectada)');
+          }
+        } catch (e) {
+          // Si el reintento falla, nos quedamos con la respuesta original.
+          console.warn(`[tools-in-system] reintento correctivo falló: ${e.message}`);
+        }
+      }
+    }
+
+    if (trimmedCount > 0) {
+      const prev = parseInt(res.getHeader('X-Gemini-Trimmed-Messages') || '0', 10);
+      res.setHeader('X-Gemini-Trimmed-Messages', String(prev + trimmedCount));
+    }
+    if (retried) res.setHeader('X-Gemini-Delegation-Retry', '1');
 
     const sanitized = sanitizeContinueToolBlocks(text, systemToolNames);
     if (sanitized.replaced > 0) {

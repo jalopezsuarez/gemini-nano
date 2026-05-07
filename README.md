@@ -525,13 +525,30 @@ clásico: pide `edit_file` cuando estás en Plan Mode y solo hay tools de
 lectura), Continue muestra `Invalid Tool Call: Tool X not found` y
 aborta el agente.
 
-Para mitigarlo, el proxy hace un **post-procesado** de la respuesta:
+Para mitigarlo, el proxy aplica tres niveles de defensa:
 
-1. Escanea los mensajes `system` extrayendo todos los nombres válidos
-   (`TOOL_NAME:`, `Available tools:`, `use the X tool`, listas tras
-   `Also:` / `Tools:` / `Available:`, JSON-Schema con `"name":"X"`).
-2. Recorre la respuesta de Nano y por cada bloque ` ```tool TOOL_NAME: X``` `:
-   - Si X está en el catálogo, lo deja intacto.
+1. **Refuerzo del system** (preventivo). Tras detectar nombres de tools en
+   el `system` que envió Continue, el proxy clasifica las tools en *read*
+   (`read_file`, `read_currently_open_file`, `ls`, `grep_search`, …) y
+   *edit* (`write_to_file`, `edit_file`, `apply_diff`, …). Inyecta un
+   bloque "CRITICAL TOOL-USE BEHAVIOR" al final del system con reglas
+   dirigidas: "NUNCA pidas al usuario que pegue archivos — usa la tool
+   de lectura disponible inmediatamente; si menciona un fichero por
+   nombre/extensión llama a `read_file` sin explicar antes". Esto
+   elimina la respuesta clásica *"please paste the content"*.
+2. **Reintento correctivo** (1 vez como mucho). Si pese al refuerzo Nano
+   responde sin emitir bloque ` ```tool``` ` Y el texto contiene patrones
+   de delegación (`paste`, `share`, `provide`, `I need to see…`,
+   `once you paste…`), el proxy lanza una segunda llamada con la
+   respuesta del modelo + un user message correctivo que repite las
+   tools válidas y pide responder con UN bloque tool y nada más.
+   Si tiene éxito, devuelve la nueva respuesta. Header
+   `X-Gemini-Delegation-Retry: 1` lo señala.
+3. **Sanitización de nombres alucinados** (post-procesado). Recorre el
+   output y por cada bloque ` ```tool TOOL_NAME: X``` `:
+   - Si X está en el catálogo (extraído via `TOOL_NAME:`,
+     `Available tools:`, `use the X tool`, listas tras `Also:` / `Tools:` /
+     `Available:`, JSON-Schema con `"name":"X"`), lo deja intacto.
    - Si X no está, **reemplaza el bloque** por una nota legible:
      `_(I tried to call a tool named X, but it is not available. Tools I can use: …. Switch Continue to Agent mode if you want edits.)_`
 
