@@ -354,6 +354,7 @@ JavaScript dentro de una pestaña de Chrome. Esto es lo que hace el proxy:
 | `NotSupportedError: requested language` | Idioma no soportado por Nano | Pasar siempre `en`; añade *"Always answer in Spanish"* al system prompt |
 | Chat web "proxy no responde" (rojo) | Proxy parado o Canary cayó | `./start.sh` otra vez |
 | Continue / Cursor: `API_KEY_INVALID` de `googleapis.com` | `provider: gemini` ignora `apiBase` | Usa `provider: openai` (ver sección de Continue) |
+| `The input is too large.` / 413 `context_length_exceeded` | El prompt + historia excede los ~6k tokens de Nano | El proxy ya recorta historia automáticamente (ver *Auto-trim*); si el último user solo ya excede, reduce el prompt o `defaultCompletionOptions.contextLength` en Continue |
 | Tras reiniciar Canary normal, se desconecta | Nuestro setup vive en perfil aparte; tu Canary normal no le afecta | No debería pasar — si pasa, mira `/tmp/canary.log` |
 
 ## Limitaciones / gotchas
@@ -363,9 +364,46 @@ JavaScript dentro de una pestaña de Chrome. Esto es lo que hace el proxy:
   para forzar respuestas en español, ponlo en el `system` prompt
   (*"Always answer in Spanish."*).
 - **Tokens / contexto**: la ventana de Nano es ~6k tokens. Conversaciones
-  largas pueden saturar y cortar.
+  largas pueden saturar y cortar. El proxy mitiga esto con **auto-trim**
+  (ver siguiente apartado).
 - **Si pierdes el debugger** (cierras Canary, cambias de red…), reejecuta
   `./start.sh`.
 - **Sin telemetría de tokens**: los campos `usage.*` en la respuesta van a
   cero porque la API de Chrome no expone tokens consumidos en formato
   comparable a OpenAI.
+
+## Auto-trim de contexto
+
+Gemini Nano rechaza la entrada con `"The input is too large."` cuando el
+prompt + historia + system superan su `inputQuota` (~6k tok). El proxy
+gestiona esto automáticamente antes de enviar la petición:
+
+1. Crea una **sesión scratch** y mide con `LanguageModel.measureInputUsage()`
+   el coste del último mensaje del usuario y de cada mensaje histórico.
+2. Calcula `budget = inputQuota − inputUsage − userCost − safety` (donde
+   `safety` cubre el overhead de los separadores entre roles, configurable
+   con `INPUT_SAFETY_TOKENS`, default 256).
+3. **Mantiene siempre el `system` y los mensajes más recientes** que quepan
+   en `budget`, descartando los más antiguos.
+4. Si Chrome aun así rechaza (la heurística es conservadora pero no
+   perfecta), reintenta hasta `TRIM_MAX_RETRIES` veces (default 4) quitando
+   un mensaje histórico más cada vez.
+5. Si ni recortando cabe (porque el último user solo ya excede), responde
+   **`413 context_length_exceeded`** con el JSON estándar de OpenAI:
+
+   ```json
+   { "error": {
+       "message": "El último mensaje del usuario (~7842 tok) no cabe…",
+       "type": "context_length_exceeded",
+       "details": { "quota": 6144, "overhead": 12, "userCost": 7842 } } }
+   ```
+
+Cuando hay recorte, el proxy añade el header **`X-Gemini-Trimmed-Messages: N`**
+para que el cliente sepa cuántos mensajes históricos se descartaron.
+
+Variables de entorno relacionadas:
+
+```bash
+INPUT_SAFETY_TOKENS=256   # margen contra overhead que measureInputUsage no ve
+TRIM_MAX_RETRIES=4        # reintentos extra si Chrome rechaza tras planificar
+```

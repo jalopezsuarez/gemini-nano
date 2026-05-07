@@ -27,6 +27,13 @@ const PORT              = parseInt(process.env.PORT || '8765', 10);
 const HOST              = process.env.HOST || '127.0.0.1';
 const REMOTE_DEBUG_PORT = parseInt(process.env.CDP_PORT || '9222', 10);
 
+// Margen de tokens que dejamos sin usar al planificar el contexto. Cubre el
+// overhead de separadores / role tokens que measureInputUsage() no contempla
+// cuando medimos cada mensaje en aislamiento.
+const INPUT_SAFETY_TOKENS = parseInt(process.env.INPUT_SAFETY_TOKENS || '256', 10);
+// Reintentos extra de recorte si la heurística infraestima y Chrome aun rechaza.
+const TRIM_MAX_RETRIES = parseInt(process.env.TRIM_MAX_RETRIES || '4', 10);
+
 // Página host: file:// es contexto seguro en Chrome, así que LanguageModel
 // se expone igual que en HTTPS. Sin red, sin dependencias externas.
 const HOST_HTML_PATH = path.join(os.tmpdir(), 'gemini-nano-proxy-host.html');
@@ -156,6 +163,113 @@ function buildCreateOpts({ messages, temperature, top_k, language }) {
   return opts;
 }
 
+// Detecta el "input too large" de la Prompt API (varía un poco entre builds).
+const TOO_LARGE_RE = /too large|exceed|context|quota|QuotaExceeded/i;
+function isTooLargeError(err) {
+  return TOO_LARGE_RE.test(String(err?.message || err || ''));
+}
+
+// Mide en una sesión "scratch" (sin initialPrompts) cuánto cuesta el último
+// user text y cada uno de los mensajes históricos. Devuelve también la
+// `inputQuota` y el overhead base del modelo. Fall back a Infinity/0 si la
+// build de Chrome no expone esos campos.
+async function measureContext(opts, userText) {
+  const initialPrompts = opts.initialPrompts || [];
+  const expectedInputs = opts.expectedInputs || [];
+  const expectedOutputs = opts.expectedOutputs || [];
+  const expr = `(async () => {
+    const s = await LanguageModel.create({
+      expectedInputs:  ${JSON.stringify(expectedInputs)},
+      expectedOutputs: ${JSON.stringify(expectedOutputs)},
+    });
+    try {
+      const quota    = (typeof s.inputQuota === 'number') ? s.inputQuota : Infinity;
+      const overhead = (typeof s.inputUsage === 'number') ? s.inputUsage : 0;
+      const initial  = ${JSON.stringify(initialPrompts)};
+      const userCost = await s.measureInputUsage(${JSON.stringify(userText)});
+      const costs = [];
+      for (const m of initial) {
+        const txt = (typeof m.content === 'string') ? m.content : JSON.stringify(m.content);
+        costs.push(await s.measureInputUsage(txt));
+      }
+      return { quota, overhead, userCost, costs };
+    } finally { try { s.destroy(); } catch {} }
+  })()`;
+  return evalInChrome(expr);
+}
+
+// Decide qué `initialPrompts` mantener para que entren en la cuota.
+// Reglas:
+//   - Si hay un mensaje role=system, se preserva (la spec sólo permite uno
+//     y debe ir al principio).
+//   - Del resto, se mantienen los más recientes mientras quepan.
+//   - `fits=false` significa que ni manteniendo sólo system + último user
+//     entra; en ese caso devolvemos lo más razonable y el caller decidirá
+//     si responde 413.
+function planTrim(initialPrompts, plan) {
+  const initial = initialPrompts || [];
+  if (!initial.length) return { initialPrompts: [], trimmedCount: 0, fits: true };
+
+  const { quota, overhead, userCost, costs } = plan;
+  if (!Number.isFinite(quota)) {
+    return { initialPrompts: initial, trimmedCount: 0, fits: true };
+  }
+
+  const budget = quota - overhead - userCost - INPUT_SAFETY_TOKENS;
+  if (budget <= 0) {
+    return { initialPrompts: [], trimmedCount: initial.length, fits: false };
+  }
+
+  const sysIdx  = initial.findIndex((m) => m.role === 'system');
+  const sysCost = sysIdx >= 0 ? costs[sysIdx] : 0;
+  if (sysCost > budget) {
+    const out = sysIdx >= 0 ? [initial[sysIdx]] : [];
+    return { initialPrompts: out, trimmedCount: initial.length - out.length, fits: false };
+  }
+
+  let used = sysCost;
+  const kept = [];
+  for (let i = initial.length - 1; i >= 0; i--) {
+    if (i === sysIdx) continue;
+    const c = costs[i];
+    if (used + c > budget) break;
+    used += c;
+    kept.unshift(initial[i]);
+  }
+
+  const out = [];
+  if (sysIdx >= 0) out.push(initial[sysIdx]);
+  out.push(...kept);
+  return { initialPrompts: out, trimmedCount: initial.length - out.length, fits: true };
+}
+
+// Recorta un nivel más (drop the oldest non-system) — fallback cuando
+// Chrome rechaza la entrada pese a la planificación.
+function dropOldestNonSystem(initialPrompts) {
+  const initial = (initialPrompts || []).slice();
+  const idx = initial.findIndex((m) => m.role !== 'system');
+  if (idx < 0) return null;
+  initial.splice(idx, 1);
+  return initial;
+}
+
+async function fitInitialPrompts(opts, userText) {
+  let plan;
+  try { plan = await measureContext(opts, userText); }
+  catch (e) {
+    console.warn(`[fit] measureContext falló: ${e.message} — sigo sin plan`);
+    return { opts, trimmedCount: 0, fits: true, plan: null };
+  }
+  const { initialPrompts, trimmedCount, fits } = planTrim(opts.initialPrompts, plan);
+  const next = { ...opts };
+  if (initialPrompts.length) next.initialPrompts = initialPrompts;
+  else delete next.initialPrompts;
+  if (trimmedCount > 0) {
+    console.log(`[fit] recortados ${trimmedCount} mensajes históricos (quota=${plan.quota}, overhead=${plan.overhead}, userCost=${plan.userCost}, safety=${INPUT_SAFETY_TOKENS})`);
+  }
+  return { opts: next, trimmedCount, fits, plan };
+}
+
 async function runPrompt(opts, userText) {
   const expr = `(async () => {
     const session = await LanguageModel.create(${JSON.stringify(opts)});
@@ -163,6 +277,36 @@ async function runPrompt(opts, userText) {
     finally { try { session.destroy(); } catch {} }
   })()`;
   return evalInChrome(expr);
+}
+
+// Igual que runPrompt pero con fallback de recorte si Chrome dice "too large".
+// Devuelve { text, trimmedCount } sumando los recortes que hagamos en el loop.
+async function runPromptWithFit(opts, userText) {
+  let totalTrim = 0;
+  let attempt = opts;
+  for (let i = 0; i <= TRIM_MAX_RETRIES; i++) {
+    try {
+      const text = await runPrompt(attempt, userText);
+      return { text, trimmedCount: totalTrim };
+    } catch (e) {
+      if (!isTooLargeError(e)) throw e;
+      const next = dropOldestNonSystem(attempt.initialPrompts);
+      if (!next) {
+        const err = new Error('input_too_large');
+        err.code = 'INPUT_TOO_LARGE';
+        err.cause = e;
+        throw err;
+      }
+      totalTrim++;
+      attempt = { ...attempt };
+      if (next.length) attempt.initialPrompts = next;
+      else delete attempt.initialPrompts;
+      console.warn(`[fit] retry ${i + 1}: chrome rechazó; descarto el mensaje histórico más antiguo`);
+    }
+  }
+  const err = new Error('input_too_large_after_retries');
+  err.code = 'INPUT_TOO_LARGE';
+  throw err;
 }
 
 function streamPrompt(opts, userText, { onChunk, onEnd, onError }) {
@@ -185,6 +329,40 @@ function streamPrompt(opts, userText, { onChunk, onEnd, onError }) {
     onError?.(err);
   });
   return sinkId;
+}
+
+// Lanza streamPrompt con reintentos de recorte si el primer error que
+// llega por el sink es "too large". Devuelve una promesa que resuelve cuando
+// el stream termina o falla con un error no recuperable.
+function streamPromptWithFit(opts, userText, sink) {
+  let totalTrim = 0;
+  let attempt = opts;
+  let started = false; // pasa a true al recibir el primer chunk → ya no recortamos
+
+  return new Promise((resolve) => {
+    const tryOnce = () => {
+      streamPrompt(attempt, userText, {
+        onChunk: (c) => { started = true; sink.onChunk?.(c); },
+        onEnd:   () => { sink.onEnd?.(totalTrim); resolve(); },
+        onError: (e) => {
+          if (!started && isTooLargeError(e) && totalTrim < TRIM_MAX_RETRIES) {
+            const next = dropOldestNonSystem(attempt.initialPrompts);
+            if (next) {
+              totalTrim++;
+              attempt = { ...attempt };
+              if (next.length) attempt.initialPrompts = next;
+              else delete attempt.initialPrompts;
+              console.warn(`[fit] stream retry ${totalTrim}: descarto el mensaje histórico más antiguo`);
+              return tryOnce();
+            }
+          }
+          sink.onError?.(e, totalTrim);
+          resolve();
+        },
+      });
+    };
+    tryOnce();
+  });
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -230,6 +408,31 @@ async function handleChatCompletions(req, res) {
   const id = `chatcmpl-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
   const created = Math.floor(Date.now() / 1000);
 
+  // Plan: medimos quota/coste y recortamos `initialPrompts` desde el más
+  // antiguo hasta que quepa. Si ni así cabe, devolvemos 413.
+  let fitted;
+  try {
+    fitted = await fitInitialPrompts(opts, last.content);
+  } catch (e) {
+    return sendError(res, 503, `No se pudo medir contexto: ${e.message}`, 'server_error');
+  }
+  if (!fitted.fits) {
+    const p = fitted.plan || {};
+    const need = (p.userCost || 0) + INPUT_SAFETY_TOKENS;
+    return sendJson(res, 413, {
+      error: {
+        message: `El último mensaje del usuario (~${p.userCost} tok) no cabe en el contexto de Gemini Nano (quota=${p.quota}, overhead=${p.overhead}). Reduce el prompt o el contexto del cliente (ej. Continue: defaultCompletionOptions.contextLength).`,
+        type: 'context_length_exceeded',
+        param: 'messages',
+        details: { quota: p.quota, overhead: p.overhead, userCost: p.userCost, need },
+      },
+    });
+  }
+  const fittedOpts = fitted.opts;
+  if (fitted.trimmedCount > 0) {
+    res.setHeader('X-Gemini-Trimmed-Messages', String(fitted.trimmedCount));
+  }
+
   if (body.stream === true) {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream; charset=utf-8',
@@ -255,26 +458,30 @@ async function handleChatCompletions(req, res) {
     let aborted = false;
     req.on('close', () => { aborted = true; });
 
-    await new Promise((resolve) => {
-      streamPrompt(opts, last.content, {
-        onChunk: (c) => { if (!aborted) writeChunk({ content: c }); },
-        onEnd:   () => { if (!aborted) { writeChunk({}, 'stop'); res.write('data: [DONE]\n\n'); res.end(); } resolve(); },
-        onError: (e) => {
-          if (!aborted) {
-            res.write(`data: ${JSON.stringify({ error: { message: e.message, type: 'server_error' } })}\n\n`);
-            res.write('data: [DONE]\n\n');
-            res.end();
-          }
-          resolve();
-        },
-      });
+    await streamPromptWithFit(fittedOpts, last.content, {
+      onChunk: (c) => { if (!aborted) writeChunk({ content: c }); },
+      onEnd:   () => { if (!aborted) { writeChunk({}, 'stop'); res.write('data: [DONE]\n\n'); res.end(); } },
+      onError: (e) => {
+        if (aborted) return;
+        const tooLarge = isTooLargeError(e);
+        const payload = tooLarge
+          ? { error: { message: 'Input too large for Gemini Nano context, even after trimming history.', type: 'context_length_exceeded' } }
+          : { error: { message: e.message, type: 'server_error' } };
+        res.write(`data: ${JSON.stringify(payload)}\n\n`);
+        res.write('data: [DONE]\n\n');
+        res.end();
+      },
     });
     return;
   }
 
   // Non-streaming
   try {
-    const text = await runPrompt(opts, last.content);
+    const { text, trimmedCount } = await runPromptWithFit(fittedOpts, last.content);
+    if (trimmedCount > 0) {
+      const prev = parseInt(res.getHeader('X-Gemini-Trimmed-Messages') || '0', 10);
+      res.setHeader('X-Gemini-Trimmed-Messages', String(prev + trimmedCount));
+    }
     sendJson(res, 200, {
       id, object: 'chat.completion', created, model,
       choices: [{
@@ -285,6 +492,9 @@ async function handleChatCompletions(req, res) {
       usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
     });
   } catch (e) {
+    if (e?.code === 'INPUT_TOO_LARGE' || isTooLargeError(e)) {
+      return sendError(res, 413, 'Input too large for Gemini Nano context, even after trimming history.', 'context_length_exceeded');
+    }
     sendError(res, 500, e.message, 'server_error');
   }
 }
