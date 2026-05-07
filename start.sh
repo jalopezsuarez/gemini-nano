@@ -26,6 +26,11 @@ if [ ! -d "$PROFILE" ]; then
   cp -cR "$SOURCE_PROFILE" "$PROFILE"
 fi
 
+if [ ! -d "$PROJECT_DIR/node_modules" ]; then
+  echo "▸ Instalando dependencias npm…"
+  (cd "$PROJECT_DIR" && npm install --silent)
+fi
+
 # Mata instancias previas del setup (no toca tu Canary normal)
 pkill -f "Google Chrome Canary --user-data-dir=$PROFILE" 2>/dev/null || true
 pkill -f "openai-proxy.js"                                2>/dev/null || true

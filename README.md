@@ -114,9 +114,12 @@ Requisitos reales del modelo (Google los exige aunque pongas BypassPerfRequireme
 ```bash
 git clone <este-repo>
 cd GeminiLanguageModel
-npm install        # solo instala 'ws' (única dep)
 chmod +x start.sh  # por si no es ejecutable
 ```
+
+> `start.sh` instala las dependencias npm (solo `ws`) automáticamente la
+> primera vez que lo ejecutas si no existe `node_modules/`. Si prefieres
+> hacerlo a mano, lanza `npm install` antes.
 
 Edita `web/llm.json` si quieres cambiar el `systemPrompt`, `temperature`,
 `maxTokens` o `apiKey` (cualquier string vale, el proxy no la valida):
@@ -150,12 +153,13 @@ Edita `web/llm.json` si quieres cambiar el `systemPrompt`, `temperature`,
 Lanza **todo** y abre el chat en tu navegador:
 
 1. **Clona** tu perfil de Canary a `~/.canary-debug-profile` la primera vez (APFS clone, ~0 disco extra).
-2. **Mata** instancias previas del setup (no toca tu Canary normal).
-3. **Lanza Canary headless** con `--remote-debugging-port=9222 --remote-allow-origins=* --headless=new`.
-4. **Arranca el proxy Node** en `:8765` (OpenAI-compatible).
-5. **Arranca el chat web Python** en `:8001`.
-6. **Abre tu navegador** en `http://localhost:8001`.
-7. **Ctrl+C** mata las tres cosas a la vez.
+2. **Instala dependencias npm** (solo `ws`) si aún no existe `node_modules/`.
+3. **Mata** instancias previas del setup (no toca tu Canary normal).
+4. **Lanza Canary headless** con `--remote-debugging-port=9222 --remote-allow-origins=* --headless=new`.
+5. **Arranca el proxy Node** en `:8765` (OpenAI-compatible).
+6. **Arranca el chat web Python** en `:8001`.
+7. **Abre tu navegador** en `http://localhost:8001`.
+8. **Ctrl+C** mata las tres cosas a la vez.
 
 Variables opcionales:
 
