@@ -161,12 +161,32 @@ Lanza **todo** y abre el chat en tu navegador:
 7. **Abre tu navegador** en `http://localhost:8001`.
 8. **Ctrl+C** mata las tres cosas a la vez.
 
-Variables opcionales:
+Flags de línea de comando:
+
+```bash
+./start.sh --server     # solo LLM (Canary + proxy), sin chat web Python
+./start.sh --ethernet   # bindea proxy y chat a 0.0.0.0 (accesibles en LAN)
+./start.sh --server --ethernet   # ambos: proxy LAN-accesible, sin chat
+./start.sh --help       # ayuda
+```
+
+Alias aceptados: `--server` también `-s` / `--no-chat`; `--ethernet` también
+`--lan` / `--all` / `-e`.
+
+Cuando bindeas a la LAN, el script detecta tu IP local (vía `ipconfig
+getifaddr en0/en1`) y la imprime junto a las URLs (`http://10.x.x.x:8765/v1`,
+`http://10.x.x.x:8001`). El chat web reescribe automáticamente el host del
+`baseURL` del proxy a `location.hostname` cuando se accede desde una IP no
+loopback, así funciona desde otros dispositivos sin tocar `llm.json`.
+
+Variables de entorno opcionales:
 
 ```bash
 PORT=8000 CDP_PORT=9333 CHAT_PORT=9000 ./start.sh   # otros puertos
 HEADLESS=0      ./start.sh    # mostrar ventana de Canary (default: oculto)
 OPEN_BROWSER=0  ./start.sh    # no abrir el chat automáticamente
+BIND_HOST=0.0.0.0 ./start.sh  # equivalente a --ethernet
+SERVE_CHAT=0     ./start.sh   # equivalente a --server
 ```
 
 ### Endpoints
@@ -208,6 +228,24 @@ print(c.chat.completions.create(
     messages=[{"role":"user","content":"Tell me a haiku"}],
 ).choices[0].message.content)
 ```
+
+### Continue / Cursor / cualquier cliente "OpenAI-compatible"
+
+Como el proxy habla **OpenAI**, NO **Gemini**, en Continue (`config.yaml`)
+hay que usar `provider: openai`. Si pones `provider: gemini`, Continue
+ignora `apiBase` y manda la petición a `generativelanguage.googleapis.com`
+(API real de Google), que devuelve `API_KEY_INVALID`.
+
+```yaml
+- name: Gemini Nano (Google Canary)
+  provider: openai
+  model: gemini-nano
+  apiBase: http://localhost:8765/v1
+  apiKey: sk-anything   # cualquier string; el proxy no valida la cabecera
+```
+
+Mismo principio para Cursor, Zed, ChatGPT-Next-Web, LiteLLM… elige el
+provider **OpenAI-compatible** y apunta `baseURL` a `http://localhost:8765/v1`.
 
 ### Cliente JS (OpenAI SDK, streaming)
 
@@ -257,7 +295,13 @@ Características:
 - Streaming token-a-token con cursor parpadeante.
 - Botón ■ para detener generación a media respuesta.
 - Ajustes (system prompt, temperatura, max tokens) persistidos en `localStorage`.
-- Indicador de estado del proxy (verde/amarillo/rojo) con autoping cada 10 s.
+- Indicador de estado del proxy (verde/amarillo/rojo) con autoping cada 10 s
+  y métrica **tok/s** en vivo durante la generación (estimación ~4 chars/token).
+- **Reverse-proxy integrado**: `web.py` reenvía `/v1/*` y `/health` al proxy
+  local (`UPSTREAM_PROXY`, por defecto derivado de `baseURL`). Esto permite
+  exponer un único host (LAN, ngrok, Tailscale…) y que el navegador hable
+  same-origin, sin CORS ni puertos extra. El cliente reescribe automáticamente
+  `baseURL` a `/v1/` cuando se sirve la página.
 
 ## Estructura
 
@@ -309,6 +353,7 @@ JavaScript dentro de una pestaña de Chrome. Esto es lo que hace el proxy:
 | `LanguageModel is not defined` (en proxy) | Pestaña en `about:blank` o sin contexto seguro | El proxy abre `file://...host.html` automáticamente; si no, comprueba `chrome://components` |
 | `NotSupportedError: requested language` | Idioma no soportado por Nano | Pasar siempre `en`; añade *"Always answer in Spanish"* al system prompt |
 | Chat web "proxy no responde" (rojo) | Proxy parado o Canary cayó | `./start.sh` otra vez |
+| Continue / Cursor: `API_KEY_INVALID` de `googleapis.com` | `provider: gemini` ignora `apiBase` | Usa `provider: openai` (ver sección de Continue) |
 | Tras reiniciar Canary normal, se desconecta | Nuestro setup vive en perfil aparte; tu Canary normal no le afecta | No debería pasar — si pasa, mira `/tmp/canary.log` |
 
 ## Limitaciones / gotchas

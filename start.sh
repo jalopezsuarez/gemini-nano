@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Lanza Canary headless + proxy OpenAI-compatible + chat web Python — todo junto.
-# Uso:   ./start.sh
-# Salir: Ctrl+C — mata las tres cosas.
+# Uso:   ./start.sh                # arranca todo (Canary + proxy + chat web)
+#        ./start.sh --server       # solo LLM (Canary + proxy), sin chat web
+#        ./start.sh --ethernet     # bindea proxy y chat a 0.0.0.0 (accesible en LAN)
+#        ./start.sh --server --ethernet  # solo LLM, accesible en LAN
+# Salir: Ctrl+C — mata todo lo arrancado.
 
 set -eo pipefail
 
@@ -15,6 +18,29 @@ SOURCE_PROFILE="$HOME/Library/Application Support/Google/Chrome Canary"
 : "${CHAT_PORT:=8001}"     # chat web Python
 : "${HEADLESS:=1}"          # 1 = sin ventana, 0 = ventana visible
 : "${OPEN_BROWSER:=1}"      # 1 = abre el chat al final
+: "${SERVE_CHAT:=1}"        # 1 = arranca chat web, 0 = solo LLM/proxy
+: "${BIND_HOST:=127.0.0.1}" # IP a la que bindean proxy/chat (--ethernet => 0.0.0.0)
+
+for arg in "$@"; do
+  case "$arg" in
+    --server|-s|--no-chat) SERVE_CHAT=0 ;;
+    --ethernet|--lan|--all|-e) BIND_HOST=0.0.0.0 ;;
+    -h|--help)
+      sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'
+      exit 0
+      ;;
+    *)
+      echo "✗ Argumento desconocido: $arg" >&2
+      exit 2
+      ;;
+  esac
+done
+
+# Detecta IP local para mostrarla cuando bindeamos a 0.0.0.0
+LAN_IP=""
+if [ "$BIND_HOST" = "0.0.0.0" ]; then
+  LAN_IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
+fi
 
 if [ ! -x "$CANARY" ]; then
   echo "✗ Chrome Canary no encontrado en $CANARY"
@@ -83,9 +109,9 @@ fi
 echo "  ✓ CDP listo"
 
 # 2) Proxy
-echo "▸ Arrancando proxy en :$PORT…"
+echo "▸ Arrancando proxy en $BIND_HOST:$PORT…"
 cd "$PROJECT_DIR"
-PORT="$PORT" CDP_PORT="$CDP_PORT" node openai-proxy.js > /tmp/proxy.log 2>&1 &
+PORT="$PORT" HOST="$BIND_HOST" CDP_PORT="$CDP_PORT" node openai-proxy.js > /tmp/proxy.log 2>&1 &
 PROXY_PID=$!
 
 if ! wait_port "$PORT" 30 "/health"; then
@@ -93,31 +119,44 @@ if ! wait_port "$PORT" 30 "/health"; then
 fi
 echo "  ✓ proxy listo"
 
-# 3) Chat web
-echo "▸ Arrancando chat web en :$CHAT_PORT…"
-PORT="$CHAT_PORT" python3 -u "$PROJECT_DIR/web/web.py" > /tmp/chat.log 2>&1 &
-CHAT_PID=$!
+# 3) Chat web (opcional)
+if [ "$SERVE_CHAT" = "1" ]; then
+  echo "▸ Arrancando chat web en $BIND_HOST:$CHAT_PORT…"
+  PORT="$CHAT_PORT" HOST="$BIND_HOST" python3 -u "$PROJECT_DIR/web/web.py" > /tmp/chat.log 2>&1 &
+  CHAT_PID=$!
 
-if ! wait_port "$CHAT_PORT" 30 "/"; then
-  echo "✗ Chat web no abrió :$CHAT_PORT — ver /tmp/chat.log"; cleanup
+  if ! wait_port "$CHAT_PORT" 30 "/"; then
+    echo "✗ Chat web no abrió :$CHAT_PORT — ver /tmp/chat.log"; cleanup
+  fi
+  echo "  ✓ chat listo"
 fi
-echo "  ✓ chat listo"
 
 echo
 echo "  ▶ proxy: http://localhost:$PORT/v1   (model=gemini-nano)"
-echo "  ▶ chat:  http://localhost:$CHAT_PORT"
+if [ "$SERVE_CHAT" = "1" ]; then
+  echo "  ▶ chat:  http://localhost:$CHAT_PORT"
+fi
+if [ "$BIND_HOST" = "0.0.0.0" ] && [ -n "$LAN_IP" ]; then
+  echo "  ▶ LAN:   http://$LAN_IP:$PORT/v1   (proxy)"
+  if [ "$SERVE_CHAT" = "1" ]; then
+    echo "         http://$LAN_IP:$CHAT_PORT       (chat)"
+  fi
+fi
 echo "  ▶ Ctrl+C para parar todo."
 echo
 
 # Abre el chat en tu navegador por defecto (no en el Canary headless aislado)
-if [ "$OPEN_BROWSER" = "1" ]; then
-  (sleep 0.4; open "http://localhost:$CHAT_PORT") &
+if [ "$SERVE_CHAT" = "1" ] && [ "$OPEN_BROWSER" = "1" ]; then
+  open_host="localhost"
+  [ "$BIND_HOST" = "0.0.0.0" ] && [ -n "$LAN_IP" ] && open_host="$LAN_IP"
+  (sleep 0.4; open "http://$open_host:$CHAT_PORT") &
 fi
 
-# Espera (compatible con bash 3.2 de macOS) a que muera cualquiera de los tres y limpia
-while kill -0 "$CANARY_PID" 2>/dev/null \
-   && kill -0 "$PROXY_PID"  2>/dev/null \
-   && kill -0 "$CHAT_PID"   2>/dev/null; do
+# Espera (compatible con bash 3.2 de macOS) a que muera cualquiera de los procesos arrancados
+while kill -0 "$CANARY_PID" 2>/dev/null && kill -0 "$PROXY_PID" 2>/dev/null; do
+  if [ "$SERVE_CHAT" = "1" ] && ! kill -0 "$CHAT_PID" 2>/dev/null; then
+    break
+  fi
   sleep 1
 done
 cleanup

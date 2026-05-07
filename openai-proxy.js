@@ -24,6 +24,7 @@ const path = require('node:path');
 const WebSocket = require('ws');
 
 const PORT              = parseInt(process.env.PORT || '8765', 10);
+const HOST              = process.env.HOST || '127.0.0.1';
 const REMOTE_DEBUG_PORT = parseInt(process.env.CDP_PORT || '9222', 10);
 
 // Página host: file:// es contexto seguro en Chrome, así que LanguageModel
@@ -334,8 +335,9 @@ async function main() {
     console.error(`[WARN] ${e.message}\nEl servidor arranca igualmente; intentará reconectar en cada petición.`);
   }
 
-  server.listen(PORT, '127.0.0.1', () => {
-    console.log(`\n  ▶ OpenAI-compatible proxy escuchando en http://localhost:${PORT}`);
+  server.listen(PORT, HOST, () => {
+    const shown = (HOST === '0.0.0.0' || HOST === '::') ? '0.0.0.0' : HOST;
+    console.log(`\n  ▶ OpenAI-compatible proxy escuchando en http://${shown}:${PORT}`);
     console.log('    GET  /v1/models');
     console.log('    POST /v1/chat/completions  (stream y no-stream)');
     console.log('    GET  /health\n');

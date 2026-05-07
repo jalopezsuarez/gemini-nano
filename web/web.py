@@ -14,9 +14,13 @@ import os
 import sys
 import http.server
 import socketserver
+import urllib.request
+import urllib.error
 from pathlib import Path
+from urllib.parse import urlparse
 
 PORT = int(os.environ.get("PORT", "8001"))
+HOST = os.environ.get("HOST", "127.0.0.1")
 
 # Carga config desde llm.json (la misma que usa test/chat.swift).
 # Orden de búsqueda:
@@ -55,6 +59,28 @@ CONFIG.setdefault("systemPrompt", "")
 CONFIG.setdefault("temperature", 0.7)
 CONFIG.setdefault("maxTokens", 1024)
 CONFIG.setdefault("timeoutSeconds", 60)
+
+# Upstream del proxy local: por defecto se deriva del baseURL del llm.json
+# (host:puerto, sin path). Se puede sobreescribir con $UPSTREAM_PROXY.
+def _derive_upstream(base_url: str) -> str:
+    u = urlparse(base_url)
+    if not u.scheme or not u.netloc:
+        return "http://127.0.0.1:8765"
+    return f"{u.scheme}://{u.netloc}"
+
+UPSTREAM = os.environ.get("UPSTREAM_PROXY") or _derive_upstream(CONFIG["baseURL"])
+PROXY_TIMEOUT = float(CONFIG.get("timeoutSeconds", 60))
+
+# El navegador habla *siempre* en mismo-origen: web.py reenvía /v1/* y /health
+# al proxy local. Así un único host expuesto (LAN, ngrok, Tailscale…) basta.
+BROWSER_CONFIG = dict(CONFIG)
+BROWSER_CONFIG["baseURL"] = "/v1/"
+
+# Headers hop-by-hop que NO se reenvían entre cliente↔proxy↔upstream.
+_HOP_BY_HOP = {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length",
+}
 
 HTML_TEMPLATE = r"""<!doctype html>
 <html lang="es">
@@ -296,6 +322,19 @@ footer { background: var(--bg); padding: 14px 20px 18px; border-top: 1px solid t
 <script>
 const CONFIG = $$CONFIG$$;
 
+// Si la página se sirve desde una IP/host distinto de localhost (p.ej. LAN),
+// reescribimos el host del baseURL del proxy para que apunte al mismo origen.
+// Así funciona igual desde http://localhost:8001 que desde http://10.x.x.x:8001
+// sin tener que tocar llm.json.
+try {
+  const u = new URL(CONFIG.baseURL, window.location.href);
+  const isLocal = (h) => h === 'localhost' || h === '127.0.0.1' || h === '::1';
+  if (isLocal(u.hostname) && !isLocal(window.location.hostname)) {
+    u.hostname = window.location.hostname;
+    CONFIG.baseURL = u.toString();
+  }
+} catch {}
+
 if (window.marked) {
   marked.setOptions({ gfm: true, breaks: true });
 }
@@ -353,12 +392,22 @@ function setStatus(text, kind) {
 }
 
 async function ping() {
+  // Mientras streameamos no pisamos el contador de tok/s.
+  if (streaming) return;
   try {
     const r = await fetch(CONFIG.baseURL.replace(/\/v1\/?$/, '') + '/health', { signal: AbortSignal.timeout(2000) });
     const data = await r.json();
     if (data.ok && data.cdp) setStatus('on-device · via proxy', 'ok');
     else                     setStatus('proxy sin Canary', 'warn');
   } catch { setStatus('proxy no responde', 'err'); }
+}
+
+// Estimación de tokens estilo OpenAI: ~4 caracteres por token.
+// No es exacto (Gemini Nano usa otro tokenizer), pero es la heurística estándar
+// para mostrar tokens/seg en la UI cuando el modelo no devuelve usage en stream.
+function estimateTokens(text) {
+  if (!text) return 0;
+  return Math.max(1, Math.round(text.length / 4));
 }
 
 // ── UI burbujas ──────────────────────────────────
@@ -523,6 +572,11 @@ async function send() {
     const decoder = new TextDecoder();
     let buffer = '';
     let acc = '';
+    // Medición de tokens/seg: arrancamos el cronómetro con el primer delta
+    // para no contar latencia de red ni de prompt-loading.
+    let firstDeltaAt = 0;
+    let lastStatusAt = 0;
+    let lastTokens = 0;
 
     while (true) {
       const { value, done } = await reader.read();
@@ -539,12 +593,33 @@ async function send() {
           const event = JSON.parse(data);
           if (event.error) throw new Error(event.error.message || JSON.stringify(event.error));
           const delta = event.choices?.[0]?.delta?.content;
-          if (delta) { acc += delta; renderInto(bodyEl, acc); scrollToBottom(); }
+          if (delta) {
+            acc += delta;
+            renderInto(bodyEl, acc);
+            scrollToBottom();
+            const now = performance.now();
+            if (!firstDeltaAt) firstDeltaAt = now;
+            lastTokens = estimateTokens(acc);
+            // Throttle del status a ~5 Hz para no martillear el DOM.
+            if (now - lastStatusAt > 200) {
+              const secs = (now - firstDeltaAt) / 1000;
+              const tps = secs > 0 ? lastTokens / secs : 0;
+              setStatus(`on-device · via proxy · ${tps.toFixed(1)} tok/s`, 'ok');
+              lastStatusAt = now;
+            }
+          }
         } catch (e) {
           if (e instanceof SyntaxError) continue;
           throw e;
         }
       }
+    }
+
+    // Resumen final estable (tok/s medio sobre toda la generación).
+    if (firstDeltaAt) {
+      const secs = (performance.now() - firstDeltaAt) / 1000;
+      const tps = secs > 0 ? lastTokens / secs : 0;
+      setStatus(`on-device · via proxy · ${tps.toFixed(1)} tok/s · ${lastTokens} tok`, 'ok');
     }
 
     history.push({ role: 'assistant', content: acc });
@@ -561,7 +636,8 @@ async function send() {
     controller = null;
     setSendButton('send');
     inputEl.focus();
-    ping();
+    // No llamamos a ping() aquí para no pisar la línea final de tok/s;
+    // el setInterval(ping, 10000) refrescará el estado al cabo de un rato.
   }
 }
 
@@ -610,34 +686,138 @@ setInterval(ping, 10000);
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
+    # Necesario para que el navegador trate el SSE como streaming real
+    # (HTTP/1.1 + chunked / connection close decidido por upstream).
+    protocol_version = "HTTP/1.1"
+
     def do_GET(self):
         if self.path == "/" or self.path.startswith("/?"):
-            html = HTML_TEMPLATE.replace("$$CONFIG$$", json.dumps(CONFIG))
+            html = HTML_TEMPLATE.replace("$$CONFIG$$", json.dumps(BROWSER_CONFIG))
             data = html.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(data)
             return
-        self.send_response(404)
+        if self._is_proxy_path():
+            return self._proxy()
+        self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers()
+
+    def do_POST(self):
+        if self._is_proxy_path():
+            return self._proxy()
+        self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers()
+
+    def do_OPTIONS(self):
+        if self._is_proxy_path():
+            return self._proxy()
+        # Preflight CORS por defecto (no debería pegarle a /, pero por si acaso).
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type,Authorization")
+        self.send_header("Content-Length", "0")
         self.end_headers()
+
+    def _is_proxy_path(self) -> bool:
+        path = self.path.split("?", 1)[0]
+        return path == "/v1" or path.startswith("/v1/") or path == "/health"
+
+    def _proxy(self):
+        """Reverse-proxy de /v1/* y /health hacia UPSTREAM, streaming-friendly."""
+        url = UPSTREAM.rstrip("/") + self.path
+        body = None
+        if self.command in ("POST", "PUT", "PATCH"):
+            n = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(n) if n > 0 else b""
+
+        out_headers = {}
+        for k, v in self.headers.items():
+            if k.lower() in _HOP_BY_HOP:
+                continue
+            out_headers[k] = v
+        out_headers.setdefault("Host", urlparse(UPSTREAM).netloc)
+
+        req = urllib.request.Request(url, data=body, method=self.command, headers=out_headers)
+        try:
+            resp = urllib.request.urlopen(req, timeout=PROXY_TIMEOUT)
+        except urllib.error.HTTPError as e:
+            # El upstream contestó con error: lo reemitimos tal cual (incluye body).
+            self.send_response(e.code)
+            for k, v in (e.headers or {}).items():
+                if k.lower() in _HOP_BY_HOP: continue
+                self.send_header(k, v)
+            err_body = e.read() if e.fp else b""
+            self.send_header("Content-Length", str(len(err_body)))
+            self.end_headers()
+            if err_body: self.wfile.write(err_body)
+            return
+        except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
+            payload = json.dumps({
+                "error": {"message": f"upstream proxy unreachable at {UPSTREAM}: {e}",
+                          "type": "proxy_error"}
+            }).encode("utf-8")
+            self.send_response(502)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            return
+
+        # Reemite status + headers (filtrando hop-by-hop y Content-Length, ya que
+        # streameamos en chunked y el tamaño total no es conocido).
+        self.send_response(resp.status)
+        is_event_stream = (resp.headers.get("Content-Type", "").lower().startswith("text/event-stream"))
+        for k, v in resp.headers.items():
+            kl = k.lower()
+            if kl in _HOP_BY_HOP: continue
+            if kl == "content-length": continue
+            self.send_header(k, v)
+        # Forzamos chunked para soportar streams sin Content-Length.
+        self.send_header("Transfer-Encoding", "chunked")
+        if is_event_stream:
+            # Anti-buffering en proxies intermedios (nginx/ngrok-edge).
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Cache-Control", "no-cache, no-transform")
+        self.end_headers()
+
+        try:
+            while True:
+                chunk = resp.read1(8192) if hasattr(resp, "read1") else resp.read(8192)
+                if not chunk: break
+                self.wfile.write(b"%x\r\n" % len(chunk))
+                self.wfile.write(chunk)
+                self.wfile.write(b"\r\n")
+                self.wfile.flush()
+            # Terminator chunked.
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            # Cliente cerró: nada que hacer.
+            pass
+        finally:
+            try: resp.close()
+            except Exception: pass
 
     def log_message(self, fmt, *args):
         # Silencia el logging por defecto
         pass
 
 
-class ReusableTCPServer(socketserver.TCPServer):
+class ReusableTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
+    daemon_threads = True
 
 
 def main():
-    httpd = ReusableTCPServer(("127.0.0.1", PORT), Handler)
-    print(f"  ▶ Chat en http://localhost:{PORT}")
-    print(f"    config: {CONFIG_PATH}")
-    print(f"    proxy:  {CONFIG['baseURL']}")
-    print(f"    modelo: {CONFIG['model']}")
+    httpd = ReusableTCPServer((HOST, PORT), Handler)
+    shown = "0.0.0.0" if HOST in ("0.0.0.0", "::") else HOST
+    print(f"  ▶ Chat en http://{shown}:{PORT}")
+    print(f"    config:   {CONFIG_PATH}")
+    print(f"    upstream: {UPSTREAM}  (reverse-proxy /v1/* y /health)")
+    print(f"    modelo:   {CONFIG['model']}")
     print("  Ctrl+C para parar.\n")
     try:
         httpd.serve_forever()
