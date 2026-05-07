@@ -150,14 +150,69 @@ main {
 .msg.assistant .avatar { background: linear-gradient(135deg, #19c37d, #0e8c5d); color: #fff; }
 .msg.assistant .body {
   flex: 1; line-height: 1.65; padding-top: 4px;
-  white-space: pre-wrap; word-wrap: break-word;
+  white-space: normal; word-wrap: break-word;
+  min-width: 0;
 }
 .msg.assistant .body.streaming::after {
   content: '▍'; display: inline-block; animation: blink 1s steps(2) infinite;
   margin-left: 1px; color: var(--muted);
 }
 @keyframes blink { 50% { opacity: 0; } }
-.msg .body.error { color: #ff8a80; }
+.msg .body.error { color: #ff8a80; white-space: pre-wrap; }
+
+/* ── Markdown ─────────────────────────────────── */
+.md p { margin: 0 0 12px; }
+.md p:last-child { margin-bottom: 0; }
+.md ul, .md ol { padding-left: 22px; margin: 8px 0; }
+.md li { margin: 4px 0; }
+.md li > p { margin: 0; }
+.md h1, .md h2, .md h3, .md h4 { margin: 14px 0 6px; font-weight: 600; line-height: 1.3; }
+.md h1 { font-size: 1.4em; }
+.md h2 { font-size: 1.22em; }
+.md h3 { font-size: 1.08em; }
+.md h4 { font-size: 1em; color: var(--muted); }
+.md a { color: #6cb8ff; text-decoration: underline; text-underline-offset: 2px; }
+.md a:hover { color: #98cdff; }
+.md blockquote {
+  border-left: 3px solid var(--border); padding: 2px 12px; margin: 8px 0;
+  color: var(--muted);
+}
+.md hr { border: 0; border-top: 1px solid var(--border); margin: 14px 0; }
+.md code {
+  background: var(--bg-3); padding: 1px 6px; border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.9em;
+}
+.md pre {
+  background: #181818; border: 1px solid var(--border); border-radius: 10px;
+  padding: 12px 14px; overflow-x: auto; margin: 10px 0;
+  font-size: 13px; line-height: 1.55;
+}
+.md pre code { background: transparent; padding: 0; font-size: 13px; }
+.md table { border-collapse: collapse; margin: 8px 0; font-size: 14px; }
+.md th, .md td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; }
+.md th { background: var(--bg-2); font-weight: 600; }
+.md img { max-width: 100%; border-radius: 8px; }
+
+/* ── Decisions / suggestions ──────────────────── */
+.suggestions {
+  display: flex; flex-wrap: wrap; gap: 8px;
+  margin: 10px 0 0 44px;
+  opacity: 0; transform: translateY(4px);
+  animation: sug-in .25s ease-out forwards;
+}
+@keyframes sug-in { to { opacity: 1; transform: none; } }
+.suggestions .chip {
+  background: transparent; border: 1px solid var(--border);
+  color: var(--text); border-radius: 16px; padding: 6px 12px;
+  font: inherit; font-size: 13px; cursor: pointer;
+  transition: background .15s, border-color .15s;
+  display: inline-flex; align-items: center; gap: 6px;
+  max-width: 100%; text-align: left;
+}
+.suggestions .chip:hover { background: var(--bg-2); border-color: #6e6e6e; }
+.suggestions .chip:disabled { opacity: 0.45; cursor: default; }
+.suggestions .chip::before { content: '↗'; color: var(--muted); font-size: 11px; }
 
 /* ── Composer ─────────────────────────────────────── */
 footer { background: var(--bg); padding: 14px 20px 18px; border-top: 1px solid transparent; }
@@ -236,8 +291,19 @@ footer { background: var(--bg); padding: 14px 20px 18px; border-top: 1px solid t
   </div>
 </footer>
 
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.5/dist/purify.min.js"></script>
 <script>
 const CONFIG = $$CONFIG$$;
+
+if (window.marked) {
+  marked.setOptions({ gfm: true, breaks: true });
+}
+function renderMarkdown(text) {
+  if (!window.marked) return null;
+  const html = marked.parse(text || '');
+  return window.DOMPurify ? DOMPurify.sanitize(html) : html;
+}
 
 const $ = (id) => document.getElementById(id);
 const threadEl   = $('thread');
@@ -316,11 +382,16 @@ function addAssistantMessage() {
   av.className = 'avatar';
   av.textContent = '✦';
   const body = document.createElement('div');
-  body.className = 'body streaming';
+  body.className = 'body md streaming';
   wrap.append(av, body);
   threadEl.appendChild(wrap);
   scrollToBottom();
   return body;
+}
+function renderInto(bodyEl, text) {
+  const html = renderMarkdown(text);
+  if (html !== null) bodyEl.innerHTML = html;
+  else bodyEl.textContent = text;
 }
 function addError(message) {
   hideEmpty();
@@ -342,11 +413,77 @@ function autoresize() {
   inputEl.style.height = Math.min(inputEl.scrollHeight, 200) + 'px';
 }
 
+// ── Decisions / suggestions ──────────────────────
+function clearSuggestions() {
+  threadEl.querySelectorAll('.suggestions').forEach((el) => el.remove());
+}
+function renderSuggestions(items) {
+  if (!Array.isArray(items) || items.length === 0) return;
+  const cleaned = items
+    .map((s) => String(s).trim())
+    .filter((s) => s.length > 0 && s.length <= 140)
+    .slice(0, 3);
+  if (cleaned.length === 0) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'suggestions';
+  cleaned.forEach((q) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'chip';
+    b.textContent = q;
+    b.addEventListener('click', () => {
+      if (streaming) return;
+      threadEl.querySelectorAll('.suggestions .chip').forEach((c) => (c.disabled = true));
+      inputEl.value = q;
+      autoresize();
+      send();
+    });
+    wrap.appendChild(b);
+  });
+  threadEl.appendChild(wrap);
+  scrollToBottom();
+}
+async function fetchSuggestions() {
+  const sysPrompt =
+    'Genera EXACTAMENTE 3 preguntas cortas que el usuario podría querer hacer a continuación, ' +
+    'basadas en la última respuesta del asistente. Cada una de máximo 9 palabras, en el mismo idioma que la conversación. ' +
+    'Responde SOLO con un array JSON de 3 strings, sin markdown, sin explicaciones. ' +
+    'Ejemplo: ["Pregunta uno", "Pregunta dos", "Pregunta tres"]';
+  const messages = [
+    { role: 'system', content: sysPrompt },
+    ...history.slice(-6),
+    { role: 'user', content: 'Devuélveme ahora el array JSON con 3 sugerencias.' },
+  ];
+  try {
+    const r = await fetch(CONFIG.baseURL.replace(/\/$/, '') + '/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${CONFIG.apiKey}` },
+      body: JSON.stringify({
+        model: CONFIG.model,
+        messages,
+        temperature: 0.6,
+        max_tokens: 160,
+        stream: false,
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!r.ok) return;
+    const data = await r.json();
+    const txt = data.choices?.[0]?.message?.content || '';
+    const m = txt.match(/\[[\s\S]*\]/);
+    if (!m) return;
+    let items;
+    try { items = JSON.parse(m[0]); } catch { return; }
+    renderSuggestions(items);
+  } catch { /* silent */ }
+}
+
 // ── Send ──────────────────────────────────────────
 async function send() {
   const text = inputEl.value.trim();
   if (!text || streaming) return;
 
+  clearSuggestions();
   inputEl.value = ''; autoresize();
   addUserMessage(text);
   history.push({ role: 'user', content: text });
@@ -402,7 +539,7 @@ async function send() {
           const event = JSON.parse(data);
           if (event.error) throw new Error(event.error.message || JSON.stringify(event.error));
           const delta = event.choices?.[0]?.delta?.content;
-          if (delta) { acc += delta; bodyEl.textContent = acc; scrollToBottom(); }
+          if (delta) { acc += delta; renderInto(bodyEl, acc); scrollToBottom(); }
         } catch (e) {
           if (e instanceof SyntaxError) continue;
           throw e;
@@ -411,6 +548,7 @@ async function send() {
     }
 
     history.push({ role: 'assistant', content: acc });
+    if (acc.trim()) fetchSuggestions();
   } catch (err) {
     bodyEl.parentElement.remove();
     if (err.name === 'AbortError') addError('Detenido.');

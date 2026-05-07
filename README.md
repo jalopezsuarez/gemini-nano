@@ -244,7 +244,12 @@ cwd o un path en `$LLM_CONFIG`):
 ```
 
 Características:
-- Burbuja de usuario / texto plano de asistente (estilo ChatGPT).
+- Burbuja de usuario / **respuesta del asistente con Markdown renderizado**
+  (headings, listas, tablas, code blocks, blockquote, links, GFM) vía
+  `marked` + `DOMPurify` por CDN. Si los CDN no cargan, fallback a texto plano.
+- **Sugerencias de continuación ("decisions")**: tras cada respuesta, el
+  propio modelo genera 3 preguntas cortas que aparecen como chips clicables
+  bajo el mensaje. Pulsar un chip envía esa pregunta como nuevo turno.
 - Streaming token-a-token con cursor parpadeante.
 - Botón ■ para detener generación a media respuesta.
 - Ajustes (system prompt, temperatura, max tokens) persistidos en `localStorage`.
