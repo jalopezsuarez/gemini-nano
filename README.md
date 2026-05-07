@@ -114,12 +114,18 @@ Requisitos reales del modelo (Google los exige aunque pongas BypassPerfRequireme
 ```bash
 git clone <este-repo>
 cd GeminiLanguageModel
-chmod +x start.sh  # por si no es ejecutable
+chmod +x run.py  # por si no es ejecutable (POSIX)
 ```
 
-> `start.sh` instala las dependencias npm (solo `ws`) automáticamente la
+> `run.py` instala las dependencias npm (solo `ws`) automáticamente la
 > primera vez que lo ejecutas si no existe `node_modules/`. Si prefieres
 > hacerlo a mano, lanza `npm install` antes.
+>
+> Multiplataforma: `run.py` corre en macOS, Linux y Windows. Detecta
+> automáticamente Canary y el perfil de origen según el SO; puedes
+> sobreescribirlos con las variables de entorno `CANARY_BIN` y
+> `SOURCE_PROFILE`. En Windows usa `python run.py` (los logs van a
+> `%TEMP%` en vez de `/tmp/`).
 
 Edita `web/llm.json` si quieres cambiar el `systemPrompt`, `temperature`,
 `maxTokens` o `apiKey` (cualquier string vale, el proxy no la valida):
@@ -136,23 +142,25 @@ Edita `web/llm.json` si quieres cambiar el `systemPrompt`, `temperature`,
 }
 ```
 
-> **Importante**: la primera vez que se ejecuta `start.sh`, **clona** tu
-> perfil de Canary (`~/Library/Application Support/Google/Chrome Canary`)
-> a `~/.canary-debug-profile` con `cp -cR` (APFS clone, ~0 bytes extra).
-> Esto se hace porque `--remote-debugging-port` está bloqueado en perfiles
-> con Google Sync activo.
+> **Importante**: la primera vez que se ejecuta `run.py`, **clona** tu
+> perfil de Canary a `~/.canary-debug-profile` (en macOS con `cp -cR` =
+> APFS clone, ~0 bytes; en Linux con `cp --reflink=auto` cuando hay
+> btrfs/xfs; en Windows con `shutil.copytree`). Esto se hace porque
+> `--remote-debugging-port` está bloqueado en perfiles con Google Sync
+> activo.
 
 ## Uso
 
 ### Una sola línea
 
 ```bash
-./start.sh
+./run.py            # macOS / Linux
+python run.py       # Windows
 ```
 
 Lanza **todo** y abre el chat en tu navegador:
 
-1. **Clona** tu perfil de Canary a `~/.canary-debug-profile` la primera vez (APFS clone, ~0 disco extra).
+1. **Clona** tu perfil de Canary a `~/.canary-debug-profile` la primera vez (APFS clone en mac, reflink en Linux si está disponible, copia normal en Windows).
 2. **Instala dependencias npm** (solo `ws`) si aún no existe `node_modules/`.
 3. **Mata** instancias previas del setup (no toca tu Canary normal).
 4. **Lanza Canary headless** con `--remote-debugging-port=9222 --remote-allow-origins=* --headless=new`.
@@ -164,17 +172,18 @@ Lanza **todo** y abre el chat en tu navegador:
 Flags de línea de comando:
 
 ```bash
-./start.sh --server     # solo LLM (Canary + proxy), sin chat web Python
-./start.sh --ethernet   # bindea proxy y chat a 0.0.0.0 (accesibles en LAN)
-./start.sh --server --ethernet   # ambos: proxy LAN-accesible, sin chat
-./start.sh --help       # ayuda
+./run.py --server     # solo LLM (Canary + proxy), sin chat web Python
+./run.py --ethernet   # bindea proxy y chat a 0.0.0.0 (accesibles en LAN)
+./run.py --server --ethernet   # ambos: proxy LAN-accesible, sin chat
+./run.py --help       # ayuda
 ```
 
 Alias aceptados: `--server` también `-s` / `--no-chat`; `--ethernet` también
 `--lan` / `--all` / `-e`.
 
-Cuando bindeas a la LAN, el script detecta tu IP local (vía `ipconfig
-getifaddr en0/en1`) y la imprime junto a las URLs (`http://10.x.x.x:8765/v1`,
+Cuando bindeas a la LAN, el script detecta tu IP local (truco
+`socket.connect("8.8.8.8")` + `getsockname()`, sin enviar paquetes) y la
+imprime junto a las URLs (`http://10.x.x.x:8765/v1`,
 `http://10.x.x.x:8001`). El chat web reescribe automáticamente el host del
 `baseURL` del proxy a `location.hostname` cuando se accede desde una IP no
 loopback, así funciona desde otros dispositivos sin tocar `llm.json`.
@@ -182,11 +191,13 @@ loopback, así funciona desde otros dispositivos sin tocar `llm.json`.
 Variables de entorno opcionales:
 
 ```bash
-PORT=8000 CDP_PORT=9333 CHAT_PORT=9000 ./start.sh   # otros puertos
-HEADLESS=0      ./start.sh    # mostrar ventana de Canary (default: oculto)
-OPEN_BROWSER=0  ./start.sh    # no abrir el chat automáticamente
-BIND_HOST=0.0.0.0 ./start.sh  # equivalente a --ethernet
-SERVE_CHAT=0     ./start.sh   # equivalente a --server
+PORT=8000 CDP_PORT=9333 CHAT_PORT=9000 ./run.py   # otros puertos
+HEADLESS=0      ./run.py    # mostrar ventana de Canary (default: oculto)
+OPEN_BROWSER=0  ./run.py    # no abrir el chat automáticamente
+BIND_HOST=0.0.0.0 ./run.py  # equivalente a --ethernet
+SERVE_CHAT=0     ./run.py   # equivalente a --server
+CANARY_BIN=/path/to/chrome ./run.py     # binario de Canary explícito
+SOURCE_PROFILE=/path/to/profile ./run.py # perfil de origen a clonar
 ```
 
 ### Endpoints
@@ -323,7 +334,7 @@ Características:
 ```
 .
 ├── openai-proxy.js   # proxy HTTP ↔ CDP (Node)
-├── start.sh           # launcher: Canary headless + proxy + chat web
+├── run.py            # launcher multiplataforma: Canary headless + proxy + chat web
 ├── web/
 │   ├── web.py         # cliente web ChatGPT-style (Python + HTML/CSS/JS)
 │   └── llm.json       # config compartida (baseURL, model, etc.)
@@ -362,15 +373,15 @@ JavaScript dentro de una pestaña de Chrome. Esto es lo que hace el proxy:
 
 | Síntoma | Causa probable | Fix |
 |---|---|---|
-| `start.sh: line N: PROXY_PORT?: unbound variable` | Bash 3.2 viejo de macOS | Ya está parcheado (no usamos `set -u`). Re-clona el repo. |
-| `✗ Canary no abrió :9222` | Tu Canary normal interfiere o el flag se ignora | `pkill -f "Google Chrome Canary"` y vuelve a lanzar `start.sh` |
-| `CDP no disponible: 403` | Falta `--remote-allow-origins=*` | Mata Canary y relanza con `start.sh` (ya lo incluye) |
+| `✗ Chrome Canary no encontrado en …` | Canary instalado en una ruta no estándar | Define `CANARY_BIN=/ruta/a/chrome` antes de `run.py` |
+| `✗ Canary no abrió :9222` | Tu Canary normal interfiere o el flag se ignora | `pkill -f "Google Chrome Canary"` (POSIX) o cierra Canary y vuelve a lanzar `run.py` |
+| `CDP no disponible: 403` | Falta `--remote-allow-origins=*` | Mata Canary y relanza con `run.py` (ya lo incluye) |
 | `LanguageModel is not defined` (en proxy) | Pestaña en `about:blank` o sin contexto seguro | El proxy abre `file://...host.html` automáticamente; si no, comprueba `chrome://components` |
 | `NotSupportedError: requested language` | Idioma no soportado por Nano | Pasar siempre `en`; añade *"Always answer in Spanish"* al system prompt |
-| Chat web "proxy no responde" (rojo) | Proxy parado o Canary cayó | `./start.sh` otra vez |
+| Chat web "proxy no responde" (rojo) | Proxy parado o Canary cayó | Vuelve a lanzar `./run.py` |
 | Continue / Cursor: `API_KEY_INVALID` de `googleapis.com` | `provider: gemini` ignora `apiBase` | Usa `provider: openai` (ver sección de Continue) |
 | `The input is too large.` / 413 `context_length_exceeded` | El prompt + historia excede los ~6k tokens de Nano | El proxy ya recorta historia automáticamente (ver *Auto-trim*); si el último user solo ya excede, reduce el prompt o `defaultCompletionOptions.contextLength` en Continue |
-| Tras reiniciar Canary normal, se desconecta | Nuestro setup vive en perfil aparte; tu Canary normal no le afecta | No debería pasar — si pasa, mira `/tmp/canary.log` |
+| Tras reiniciar Canary normal, se desconecta | Nuestro setup vive en perfil aparte; tu Canary normal no le afecta | No debería pasar — si pasa, mira `/tmp/canary.log` (Windows: `%TEMP%\canary.log`) |
 
 ## Limitaciones / gotchas
 
@@ -382,7 +393,7 @@ JavaScript dentro de una pestaña de Chrome. Esto es lo que hace el proxy:
   largas pueden saturar y cortar. El proxy mitiga esto con **auto-trim**
   (ver siguiente apartado).
 - **Si pierdes el debugger** (cierras Canary, cambias de red…), reejecuta
-  `./start.sh`.
+  `./run.py`.
 - **Sin telemetría de tokens**: los campos `usage.*` en la respuesta van a
   cero porque la API de Chrome no expone tokens consumidos en formato
   comparable a OpenAI.
