@@ -10,6 +10,30 @@ Por debajo, el proxy pilota una pestaña de **Chrome Canary** vía CDP
 (Chrome DevTools Protocol). Es Nano real, ejecutado por Chromium, no una
 emulación. Todo on-device.
 
+**Funcionalidades destacadas:**
+
+- API OpenAI-compatible (`/v1/chat/completions`, `/v1/models`, `/health`),
+  streaming SSE y no-streaming.
+- **Auto-trim** de la historia de chat para que entre en los ~6k tokens
+  de Nano (recorta los mensajes más antiguos y mide con
+  `LanguageModel.measureInputUsage()`); responde **`413
+  context_length_exceeded`** si ni recortando cabe.
+- **Tool calling emulado** (formato OpenAI `tools=[…]`) — inyecta el
+  catálogo en el system, parsea `tool_calls` desde el output y los
+  reemite con `finish_reason: "tool_calls"`.
+- **Compatibilidad con Continue** (Plan/Agent mode) que mete las tools
+  como bloques de texto en el system: el proxy detecta el catálogo,
+  refuerza el system prohibiendo *"please paste"*, hace **un reintento
+  correctivo** si Nano delega al usuario, y **sanea los nombres
+  alucinados** sustituyéndolos por una nota legible.
+- **Launcher multiplataforma** (`run.py`) que orquesta Canary headless,
+  proxy y chat web para macOS, Linux y Windows.
+- **Chat web tipo ChatGPT** con Markdown, sugerencias de continuación,
+  reverse-proxy `/v1/*` (un solo host expuesto vale para LAN), métrica
+  tok/s en vivo.
+- **Headers de telemetría**: `X-Gemini-Trimmed-Messages`,
+  `X-Gemini-Sanitized-Tool-Blocks`, `X-Gemini-Delegation-Retry`.
+
 ## Cómo está montado
 
 ```
@@ -29,10 +53,15 @@ Cliente OpenAI               proxy Node                    Chrome Canary
 
 ## Requisitos
 
-- macOS con APFS (para `cp -c` clone-on-write del perfil).
+- **macOS, Linux o Windows.** En macOS aprovechamos `cp -cR` (APFS clone)
+  para clonar el perfil de Canary en ~0 bytes; en Linux con btrfs/xfs
+  usamos `cp --reflink=auto`; en Windows o si reflink no aplica, copia
+  recursiva normal.
 - **Chrome Canary** + modelo Gemini Nano descargado (ver siguiente sección).
+  En Linux es `google-chrome-unstable`; en Windows
+  `%LOCALAPPDATA%\Google\Chrome SxS\Application\chrome.exe`.
 - **Node 18+** (para `fetch` nativo y la dependencia `ws`).
-- **Python 3.9+** (solo si vas a usar el chat web).
+- **Python 3.9+** (para `run.py` y, opcionalmente, el chat web).
 
 ## Setup de Chrome Canary y Gemini Nano
 
