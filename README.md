@@ -302,6 +302,51 @@ pero no toca el último user. Soluciones:
 Mismo principio para Cursor, Zed, ChatGPT-Next-Web, LiteLLM… elige el
 provider **OpenAI-compatible** y apunta `baseURL` a `http://localhost:8765/v1`.
 
+#### Roles `apply` y `edit` (Continue Agent)
+
+Cuando estás en Agent Mode y Continue confirma una edición, no usa el
+modelo del chat: invoca al modelo asignado al rol **`apply`** (o
+`edit`) para regenerar el archivo final con el diff aplicado. Si ese
+rol apunta a un modelo no accesible (típico: un Ollama remoto en otra
+máquina LAN, p.ej. `192.168.x.x:11434`), verás
+`request to … failed, reason: connect ETIMEDOUT` y el cambio nunca se
+aplica.
+
+Configuración mínima recomendada con Nano para chat y un modelo
+fiable para apply/edit:
+
+```yaml
+models:
+  - name: Gemini Nano (chat)
+    provider: openai
+    model: gemini-nano
+    apiBase: http://localhost:8765/v1
+    apiKey: sk-anything
+    roles: [chat, agent]
+    defaultCompletionOptions:
+      contextLength: 4096
+      maxTokens: 512
+
+  # Apply/edit: usa Nano si te apañas (poco fiable en archivos grandes)…
+  - name: Apply via Nano
+    provider: openai
+    model: gemini-nano
+    apiBase: http://localhost:8765/v1
+    apiKey: sk-anything
+    roles: [apply, edit]
+
+  # …o configura un modelo cloud para esos roles (recomendado):
+  # - name: Apply (Claude Haiku)
+  #   provider: anthropic
+  #   model: claude-haiku-4-5
+  #   apiKey: ${ANTHROPIC_API_KEY}
+  #   roles: [apply, edit]
+```
+
+Si desinstalas un modelo o cambias de máquina, **revisa siempre el
+`config.yaml`** y elimina las entradas obsoletas — Continue no las
+limpia solo y los `ETIMEDOUT` son siempre por entradas zombi.
+
 ### Cliente JS (OpenAI SDK, streaming)
 
 ```js
@@ -412,6 +457,8 @@ JavaScript dentro de una pestaña de Chrome. Esto es lo que hace el proxy:
 | `The input is too large.` / 413 `context_length_exceeded` | El prompt + historia excede los ~6k tokens de Nano | El proxy ya recorta historia automáticamente (ver *Auto-trim*); si el último user solo ya excede, reduce el prompt o `defaultCompletionOptions.contextLength` en Continue |
 | Continue Agent (`tools=[]`): `Invalid Tool Call: Tool X not found` | Nano alucinó un nombre de tool fuera del catálogo | El proxy ya descarta los nombres no válidos y devuelve texto plano (ver *Tool calling emulado*); para Agent real, usa otro modelo y deja Nano en modo Chat |
 | Continue Plan/Agent (tools en el system): `Tool edit_file not found` | Nano se inventó un `TOOL_NAME` que no está en el catálogo del system | El proxy ahora reescribe esos bloques (ver *Caso especial: Continue Plan Mode*). Si pides cambios estando en Plan Mode, **cambia a Agent Mode** — Plan Mode es read-only por diseño |
+| Continue Agent: `applyToFile` falla con `ETIMEDOUT 192.168.x.x:11434` o similar | El paso *apply* (regenerar el archivo final) usa un modelo distinto al de chat — el rol `apply`/`edit` en tu `config.yaml` apunta a otro provider (ej. Ollama remoto) que no responde | NO es del proxy. Edita `~/.continue/config.yaml`: o quitas el modelo inalcanzable, o asignas `roles: [apply, edit]` a Nano (lento y poco fiable con archivos grandes), o configura un modelo cloud para esos roles |
+| Mensajes `[error] [Window] [Extension Host] Document … not found in AST tracker` en VS Code | Ruido interno de la extensión Continue al consultar su tracker de buffers — no es un fallo funcional | Ignóralo. Si te molesta, sube el filtro de Output a *Info* o cambia `logLevel: warn` en `~/.continue/config.yaml` |
 | Tras reiniciar Canary normal, se desconecta | Nuestro setup vive en perfil aparte; tu Canary normal no le afecta | No debería pasar — si pasa, mira `/tmp/canary.log` (Windows: `%TEMP%\canary.log`) |
 
 ## Limitaciones / gotchas
