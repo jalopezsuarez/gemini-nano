@@ -148,19 +148,203 @@ async function evalInChrome(expression, awaitPromise = true) {
   return r.result?.value;
 }
 
-function buildCreateOpts({ messages, temperature, top_k, language }) {
-  const initial = messages.slice(0, -1).map((m) => ({
-    role: m.role,
-    content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
-  }));
+// ─────────────────────────────────────────────────────────────
+// Tool calling emulado para Gemini Nano
+//
+// Nano no expone function-calling nativo. Para que clientes "OpenAI-tools"
+// (Continue Agent, OpenAI SDK, etc.) puedan trabajar contra él, inyectamos
+// el catálogo de tools en el system prompt + reglas estrictas de cómo
+// responder, y luego parseamos el JSON que escupa el modelo y lo
+// reemitimos en formato OpenAI tool_calls.
+// ─────────────────────────────────────────────────────────────
+
+function buildToolsSystemPrompt(tools, toolChoice) {
+  if (!Array.isArray(tools) || tools.length === 0) return null;
+
+  const catalog = tools
+    .filter((t) => t && t.type === 'function' && t.function?.name)
+    .map((t) => ({
+      name: t.function.name,
+      description: t.function.description || '',
+      parameters: t.function.parameters || { type: 'object', properties: {} },
+    }));
+  if (catalog.length === 0) return null;
+
+  const toolNames = catalog.map((c) => c.name).join(', ');
+
+  let mode = 'auto'; // auto | required | named
+  let forcedName = null;
+  if (toolChoice === 'none') return null;
+  if (toolChoice === 'required') mode = 'required';
+  else if (toolChoice && typeof toolChoice === 'object' && toolChoice.type === 'function') {
+    mode = 'named';
+    forcedName = toolChoice.function?.name || null;
+  }
+
+  const rule =
+    mode === 'required'
+      ? 'You MUST call exactly one of the available tools. Do not answer in plain text.'
+      : mode === 'named'
+        ? `You MUST call the tool "${forcedName}". Do not answer in plain text. Do not call any other tool.`
+        : 'When calling a tool is appropriate, respond with ONLY the JSON object below (no surrounding text, no markdown fences). Otherwise respond normally as plain text.';
+
+  return [
+    'You have access to the following tools:',
+    `Available tools: ${toolNames}`,
+    'Tool catalog (JSON-Schema):',
+    JSON.stringify(catalog),
+    '',
+    rule,
+    '',
+    'When you decide to call a tool, output EXACTLY one JSON object on a single line and NOTHING else, in this exact shape:',
+    '{"tool_calls":[{"name":"TOOL_NAME","arguments":{...}}]}',
+    '',
+    'Rules:',
+    '- Use only the tool names listed above. Never invent a tool name.',
+    '- The "arguments" object must conform to the tool\'s parameters schema.',
+    '- Never mix natural-language text with the JSON object in the same response.',
+    '- Never wrap the JSON in markdown fences or quotes.',
+    '- Only emit one JSON object per response.',
+  ].join('\n');
+}
+
+function flattenMessagesForNano(messages) {
+  // Nano sólo entiende roles system|user|assistant con `content` string.
+  // Convertimos:
+  //   - assistant.tool_calls → assistant con content = JSON serializado
+  //   - role:"tool" (resultado) → user con content etiquetado
+  //   - content arrays multimodal → string serializada
+  const out = [];
+  for (const m of messages) {
+    if (!m || !m.role) continue;
+    if (m.role === 'tool') {
+      const tag = m.tool_call_id ? ` for ${m.tool_call_id}` : '';
+      const body = typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '');
+      out.push({ role: 'user', content: `[tool result${tag}]\n${body}` });
+      continue;
+    }
+    if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) {
+      const calls = m.tool_calls.map((c) => ({
+        name: c.function?.name,
+        arguments: safeParseJson(c.function?.arguments) ?? {},
+      }));
+      out.push({ role: 'assistant', content: JSON.stringify({ tool_calls: calls }) });
+      continue;
+    }
+    out.push({
+      role: m.role,
+      content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? ''),
+    });
+  }
+  return out;
+}
+
+function safeParseJson(s) {
+  if (typeof s !== 'string') return s ?? null;
+  try { return JSON.parse(s); } catch { return null; }
+}
+
+function buildCreateOpts({ messages, temperature, top_k, language, tools, toolChoice }) {
+  const flat = flattenMessagesForNano(messages.slice(0, -1));
+
+  // Inyecta el catálogo de tools en el system. Si ya hay un system del
+  // cliente, anteponemos las reglas y conservamos el suyo a continuación.
+  const toolsSys = buildToolsSystemPrompt(tools, toolChoice);
+  if (toolsSys) {
+    const sysIdx = flat.findIndex((m) => m.role === 'system');
+    if (sysIdx >= 0) {
+      flat[sysIdx] = { role: 'system', content: `${toolsSys}\n\n${flat[sysIdx].content}` };
+    } else {
+      flat.unshift({ role: 'system', content: toolsSys });
+    }
+  }
+
   const opts = {
     expectedInputs:  [{ type: 'text', languages: [language] }],
     expectedOutputs: [{ type: 'text', languages: [language] }],
   };
   if (typeof temperature === 'number' && !Number.isNaN(temperature)) opts.temperature = temperature;
   if (typeof top_k === 'number' && !Number.isNaN(top_k))             opts.topK = top_k;
-  if (initial.length) opts.initialPrompts = initial;
+  if (flat.length) opts.initialPrompts = flat;
   return opts;
+}
+
+// Intenta extraer { tool_calls: [...] } del output de Nano. Acepta:
+//   - JSON puro al principio
+//   - JSON dentro de bloque ```json ... ```
+//   - JSON con texto antes/después (extrae primer { ... } balanceado)
+// Devuelve { toolCalls, leadingText } o null si no hay match válido.
+function tryExtractJsonBlock(text) {
+  if (!text) return null;
+  const trimmed = text.trim();
+
+  // 1) Bloque ```json ... ```
+  const fence = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) {
+    const obj = safeParseJson(fence[1].trim());
+    if (obj) return { obj, leadingText: trimmed.slice(0, fence.index).trim() };
+  }
+
+  // 2) JSON al principio
+  const direct = safeParseJson(trimmed);
+  if (direct) return { obj: direct, leadingText: '' };
+
+  // 3) Primer { ... } balanceado
+  const start = trimmed.indexOf('{');
+  if (start < 0) return null;
+  let depth = 0, inStr = false, esc = false;
+  for (let i = start; i < trimmed.length; i++) {
+    const ch = trimmed[i];
+    if (esc) { esc = false; continue; }
+    if (inStr) {
+      if (ch === '\\') { esc = true; continue; }
+      if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') { inStr = true; continue; }
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) {
+        const slice = trimmed.slice(start, i + 1);
+        const obj = safeParseJson(slice);
+        if (obj) return { obj, leadingText: trimmed.slice(0, start).trim() };
+        break;
+      }
+    }
+  }
+  return null;
+}
+
+function parseToolCalls(text, validNames) {
+  const block = tryExtractJsonBlock(text);
+  if (!block || !block.obj) return null;
+  let calls = null;
+  if (Array.isArray(block.obj.tool_calls)) calls = block.obj.tool_calls;
+  else if (block.obj.tool_call) calls = [block.obj.tool_call];
+  else if (block.obj.name && block.obj.arguments !== undefined) calls = [block.obj];
+  if (!calls || !calls.length) return null;
+
+  const valid = new Set(validNames);
+  const normalized = [];
+  for (const c of calls) {
+    if (!c || typeof c.name !== 'string') return null;
+    if (!valid.has(c.name)) {
+      console.warn(`[tools] modelo invocó tool desconocida "${c.name}" — descartando llamada (válidas: ${[...valid].join(', ')})`);
+      return null;
+    }
+    const args = c.arguments;
+    let argStr;
+    if (typeof args === 'string') argStr = args;
+    else if (args === undefined || args === null) argStr = '{}';
+    else argStr = JSON.stringify(args);
+    normalized.push({
+      id: `call_${Math.random().toString(36).slice(2, 12)}`,
+      type: 'function',
+      function: { name: c.name, arguments: argStr },
+    });
+  }
+  return { toolCalls: normalized, leadingText: block.leadingText || '' };
 }
 
 // Detecta el "input too large" de la Prompt API (varía un poco entre builds).
@@ -394,25 +578,41 @@ async function handleChatCompletions(req, res) {
   const messages = Array.isArray(body.messages) ? body.messages : [];
   if (!messages.length) return sendError(res, 400, '"messages" must be a non-empty array');
   const last = messages[messages.length - 1];
-  if (last.role !== 'user') return sendError(res, 400, 'Last message must have role="user"');
+  if (!last || (last.role !== 'user' && last.role !== 'tool')) {
+    return sendError(res, 400, 'Last message must have role="user" or role="tool"');
+  }
 
   const language = body.language || (req.headers['x-language']) || 'en';
+  const tools = Array.isArray(body.tools) ? body.tools : null;
+  const toolChoice = body.tool_choice ?? (tools ? 'auto' : undefined);
+  const toolsActive = !!tools && tools.length > 0 && toolChoice !== 'none';
+
+  // Si el último mensaje es role:"tool", lo aplanamos como user para Nano.
+  let lastForNano;
+  if (last.role === 'tool') {
+    const tag = last.tool_call_id ? ` for ${last.tool_call_id}` : '';
+    const body2 = typeof last.content === 'string' ? last.content : JSON.stringify(last.content ?? '');
+    lastForNano = { role: 'user', content: `[tool result${tag}]\n${body2}` };
+  } else {
+    lastForNano = { role: 'user', content: typeof last.content === 'string' ? last.content : JSON.stringify(last.content ?? '') };
+  }
+
   const opts = buildCreateOpts({
-    messages,
+    messages: [...messages.slice(0, -1), lastForNano],
     temperature: body.temperature,
     top_k: body.top_k,
     language,
+    tools,
+    toolChoice,
   });
 
   const model = body.model || 'gemini-nano';
   const id = `chatcmpl-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
   const created = Math.floor(Date.now() / 1000);
 
-  // Plan: medimos quota/coste y recortamos `initialPrompts` desde el más
-  // antiguo hasta que quepa. Si ni así cabe, devolvemos 413.
   let fitted;
   try {
-    fitted = await fitInitialPrompts(opts, last.content);
+    fitted = await fitInitialPrompts(opts, lastForNano.content);
   } catch (e) {
     return sendError(res, 503, `No se pudo medir contexto: ${e.message}`, 'server_error');
   }
@@ -431,6 +631,73 @@ async function handleChatCompletions(req, res) {
   const fittedOpts = fitted.opts;
   if (fitted.trimmedCount > 0) {
     res.setHeader('X-Gemini-Trimmed-Messages', String(fitted.trimmedCount));
+  }
+
+  // ── Modo herramientas: forzamos non-stream interno y reemitimos en el
+  // formato OpenAI (con stream=true emitimos un único par de chunks SSE).
+  if (toolsActive) {
+    const validNames = tools
+      .filter((t) => t && t.type === 'function' && t.function?.name)
+      .map((t) => t.function.name);
+    let text, trimmedCount = 0;
+    try {
+      const r = await runPromptWithFit(fittedOpts, lastForNano.content);
+      text = r.text || '';
+      trimmedCount = r.trimmedCount || 0;
+    } catch (e) {
+      if (e?.code === 'INPUT_TOO_LARGE' || isTooLargeError(e)) {
+        return sendError(res, 413, 'Input too large for Gemini Nano context, even after trimming history.', 'context_length_exceeded');
+      }
+      return sendError(res, 500, e.message, 'server_error');
+    }
+    if (trimmedCount > 0) {
+      const prev = parseInt(res.getHeader('X-Gemini-Trimmed-Messages') || '0', 10);
+      res.setHeader('X-Gemini-Trimmed-Messages', String(prev + trimmedCount));
+    }
+
+    const parsed = parseToolCalls(text, validNames);
+    const message = parsed
+      ? { role: 'assistant', content: parsed.leadingText || null, tool_calls: parsed.toolCalls }
+      : { role: 'assistant', content: text };
+    const finish_reason = parsed ? 'tool_calls' : 'stop';
+
+    if (body.stream === true) {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      });
+      const headDelta = parsed
+        ? {
+            role: 'assistant',
+            content: parsed.leadingText || null,
+            tool_calls: parsed.toolCalls.map((c, idx) => ({
+              index: idx,
+              id: c.id,
+              type: 'function',
+              function: { name: c.function.name, arguments: c.function.arguments },
+            })),
+          }
+        : { role: 'assistant', content: text };
+      res.write(`data: ${JSON.stringify({
+        id, object: 'chat.completion.chunk', created, model,
+        choices: [{ index: 0, delta: headDelta, finish_reason: null }],
+      })}\n\n`);
+      res.write(`data: ${JSON.stringify({
+        id, object: 'chat.completion.chunk', created, model,
+        choices: [{ index: 0, delta: {}, finish_reason }],
+      })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+      return;
+    }
+
+    return sendJson(res, 200, {
+      id, object: 'chat.completion', created, model,
+      choices: [{ index: 0, message, finish_reason }],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    });
   }
 
   if (body.stream === true) {
@@ -458,7 +725,7 @@ async function handleChatCompletions(req, res) {
     let aborted = false;
     req.on('close', () => { aborted = true; });
 
-    await streamPromptWithFit(fittedOpts, last.content, {
+    await streamPromptWithFit(fittedOpts, lastForNano.content, {
       onChunk: (c) => { if (!aborted) writeChunk({ content: c }); },
       onEnd:   () => { if (!aborted) { writeChunk({}, 'stop'); res.write('data: [DONE]\n\n'); res.end(); } },
       onError: (e) => {
@@ -477,7 +744,7 @@ async function handleChatCompletions(req, res) {
 
   // Non-streaming
   try {
-    const { text, trimmedCount } = await runPromptWithFit(fittedOpts, last.content);
+    const { text, trimmedCount } = await runPromptWithFit(fittedOpts, lastForNano.content);
     if (trimmedCount > 0) {
       const prev = parseInt(res.getHeader('X-Gemini-Trimmed-Messages') || '0', 10);
       res.setHeader('X-Gemini-Trimmed-Messages', String(prev + trimmedCount));

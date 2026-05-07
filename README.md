@@ -381,6 +381,7 @@ JavaScript dentro de una pestaña de Chrome. Esto es lo que hace el proxy:
 | Chat web "proxy no responde" (rojo) | Proxy parado o Canary cayó | Vuelve a lanzar `./run.py` |
 | Continue / Cursor: `API_KEY_INVALID` de `googleapis.com` | `provider: gemini` ignora `apiBase` | Usa `provider: openai` (ver sección de Continue) |
 | `The input is too large.` / 413 `context_length_exceeded` | El prompt + historia excede los ~6k tokens de Nano | El proxy ya recorta historia automáticamente (ver *Auto-trim*); si el último user solo ya excede, reduce el prompt o `defaultCompletionOptions.contextLength` en Continue |
+| Continue Agent: `Invalid Tool Call: Tool X not found` | Nano alucinó un nombre de tool fuera del catálogo | El proxy ya descarta los nombres no válidos y devuelve texto plano (ver *Tool calling emulado*); para Agent real, usa otro modelo y deja Nano en modo Chat |
 | Tras reiniciar Canary normal, se desconecta | Nuestro setup vive en perfil aparte; tu Canary normal no le afecta | No debería pasar — si pasa, mira `/tmp/canary.log` (Windows: `%TEMP%\canary.log`) |
 
 ## Limitaciones / gotchas
@@ -433,3 +434,72 @@ Variables de entorno relacionadas:
 INPUT_SAFETY_TOKENS=256   # margen contra overhead que measureInputUsage no ve
 TRIM_MAX_RETRIES=4        # reintentos extra si Chrome rechaza tras planificar
 ```
+
+## Tool calling emulado (Continue Agent, OpenAI tools)
+
+La Prompt API de Chrome **no expone function-calling nativo**, pero el
+proxy lo emula para que clientes que esperan el formato OpenAI tools
+(Continue en modo Agent, OpenAI SDK con `tools=[…]`, etc.) puedan
+trabajar contra Gemini Nano.
+
+Cómo funciona:
+
+1. Si la petición trae `body.tools` y `tool_choice !== "none"`, el proxy
+   inyecta el catálogo en el `system` (con el JSON-Schema de cada tool)
+   más reglas estrictas:
+   - "Usa sólo los nombres listados — nunca inventes uno."
+   - "Cuando llames a una tool, responde SÓLO con `{"tool_calls":[…]}`
+     en una línea, sin texto extra ni fences markdown."
+   - Si `tool_choice` es `"required"` o `{type:"function", function:{name}}`,
+     se refuerza con un *MUST*.
+2. Aplana el historial para Nano: los `assistant.tool_calls` previos se
+   reescriben como JSON en `content`; los `role:"tool"` (resultados de
+   ejecución) se reescriben como `user` con etiqueta `[tool result for ID]`.
+3. Llama a Nano siempre **non-stream** internamente (se necesita el
+   output completo para parsear el JSON). Si el cliente pidió
+   `stream:true`, el proxy reemite el resultado en 2 chunks SSE
+   compatibles con OpenAI.
+4. Parsea la respuesta buscando `{"tool_calls":[…]}` (acepta JSON puro,
+   bloque ` ```json `, JSON tras texto, y la forma corta
+   `{"name":..., "arguments":...}`).
+5. **Valida los nombres**: si Nano alucina un nombre fuera del catálogo
+   (p. ej. `edit_file` cuando solo hay `read_file`/`write_to_file`), el
+   tool_call se **descarta** y se devuelve la respuesta como texto plano.
+   Esto evita el `Invalid Tool Call: Tool X not found` que en
+   otro caso recibiría el cliente.
+
+Respuesta tipo cuando hay tool_call válida:
+
+```json
+{
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [{
+        "id": "call_xyz",
+        "type": "function",
+        "function": { "name": "read_file", "arguments": "{\"path\":\"foo.txt\"}" }
+      }]
+    },
+    "finish_reason": "tool_calls"
+  }]
+}
+```
+
+> ⚠️ **Aviso de capacidad**: Nano es muy pequeño (~6k ctx, sin
+> entrenamiento específico de tool-use). Aunque el proxy emula el
+> protocolo correctamente, el modelo:
+>
+> - inventa nombres de tools fuera del catálogo (lo descartamos, pero el
+>   resultado funcional es como "no llamó a ninguna"),
+> - mezcla texto y JSON en la misma respuesta a veces (intentamos
+>   tolerarlo extrayendo el JSON balanceado),
+> - olvida argumentos requeridos del schema.
+>
+> Para flujos de Agent reales (Continue Agent, multi-step) recomendamos
+> usar Nano sólo en **modo Chat** y configurar otro modelo (Haiku,
+> GPT-4o-mini, etc.) para Agent. El soporte de tools está pensado más
+> bien para experimentación y para clientes que toleran el fallback a
+> texto plano.
