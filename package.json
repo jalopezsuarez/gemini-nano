@@ -1,0 +1,14 @@
+{
+  "name": "gemini-nano-openai-proxy",
+  "version": "0.1.0",
+  "description": "Proxy OpenAI-compatible que pilota Gemini Nano dentro de Chrome Canary vía CDP",
+  "main": "openai-proxy.js",
+  "scripts": {
+    "start": "./start.sh",
+    "proxy": "node openai-proxy.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.20.0"
+  }
+}
