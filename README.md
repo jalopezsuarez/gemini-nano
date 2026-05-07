@@ -381,7 +381,8 @@ JavaScript dentro de una pestaña de Chrome. Esto es lo que hace el proxy:
 | Chat web "proxy no responde" (rojo) | Proxy parado o Canary cayó | Vuelve a lanzar `./run.py` |
 | Continue / Cursor: `API_KEY_INVALID` de `googleapis.com` | `provider: gemini` ignora `apiBase` | Usa `provider: openai` (ver sección de Continue) |
 | `The input is too large.` / 413 `context_length_exceeded` | El prompt + historia excede los ~6k tokens de Nano | El proxy ya recorta historia automáticamente (ver *Auto-trim*); si el último user solo ya excede, reduce el prompt o `defaultCompletionOptions.contextLength` en Continue |
-| Continue Agent: `Invalid Tool Call: Tool X not found` | Nano alucinó un nombre de tool fuera del catálogo | El proxy ya descarta los nombres no válidos y devuelve texto plano (ver *Tool calling emulado*); para Agent real, usa otro modelo y deja Nano en modo Chat |
+| Continue Agent (`tools=[]`): `Invalid Tool Call: Tool X not found` | Nano alucinó un nombre de tool fuera del catálogo | El proxy ya descarta los nombres no válidos y devuelve texto plano (ver *Tool calling emulado*); para Agent real, usa otro modelo y deja Nano en modo Chat |
+| Continue Plan/Agent (tools en el system): `Tool edit_file not found` | Nano se inventó un `TOOL_NAME` que no está en el catálogo del system | El proxy ahora reescribe esos bloques (ver *Caso especial: Continue Plan Mode*). Si pides cambios estando en Plan Mode, **cambia a Agent Mode** — Plan Mode es read-only por diseño |
 | Tras reiniciar Canary normal, se desconecta | Nuestro setup vive en perfil aparte; tu Canary normal no le afecta | No debería pasar — si pasa, mira `/tmp/canary.log` (Windows: `%TEMP%\canary.log`) |
 
 ## Limitaciones / gotchas
@@ -503,3 +504,42 @@ Respuesta tipo cuando hay tool_call válida:
 > GPT-4o-mini, etc.) para Agent. El soporte de tools está pensado más
 > bien para experimentación y para clientes que toleran el fallback a
 > texto plano.
+
+### Caso especial: Continue Plan Mode / Agent Mode (tools en el system)
+
+Continue **no** envía `body.tools`. En su lugar inyecta el catálogo dentro
+del `system` con un formato propio de bloques de texto:
+
+````
+```tool
+TOOL_NAME: read_file
+BEGIN_ARG: filepath
+path/to/file.txt
+END_ARG
+```
+````
+
+y luego parsea la respuesta del modelo buscando esos bloques. Si el
+modelo se inventa un `TOOL_NAME` (Nano lo hace constantemente —
+clásico: pide `edit_file` cuando estás en Plan Mode y solo hay tools de
+lectura), Continue muestra `Invalid Tool Call: Tool X not found` y
+aborta el agente.
+
+Para mitigarlo, el proxy hace un **post-procesado** de la respuesta:
+
+1. Escanea los mensajes `system` extrayendo todos los nombres válidos
+   (`TOOL_NAME:`, `Available tools:`, `use the X tool`, listas tras
+   `Also:` / `Tools:` / `Available:`, JSON-Schema con `"name":"X"`).
+2. Recorre la respuesta de Nano y por cada bloque ` ```tool TOOL_NAME: X``` `:
+   - Si X está en el catálogo, lo deja intacto.
+   - Si X no está, **reemplaza el bloque** por una nota legible:
+     `_(I tried to call a tool named X, but it is not available. Tools I can use: …. Switch Continue to Agent mode if you want edits.)_`
+
+Continue recibe entonces texto plano en lugar del bloque malformado, y
+el usuario ve la nota en el chat en vez de un error críptico. El header
+**`X-Gemini-Sanitized-Tool-Blocks: N`** indica cuántos bloques se
+reescribieron.
+
+> ⚠️ **Plan Mode no permite edición**, da igual lo que diga Nano. Si lo
+> que quieres es que Continue toque archivos, **cámbialo a Agent Mode**
+> en el selector de modo (icono debajo del chat).

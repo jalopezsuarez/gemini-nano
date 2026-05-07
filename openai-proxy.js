@@ -170,7 +170,8 @@ function buildToolsSystemPrompt(tools, toolChoice) {
     }));
   if (catalog.length === 0) return null;
 
-  const toolNames = catalog.map((c) => c.name).join(', ');
+  const toolNames = catalog.map((c) => c.name);
+  const toolNamesList = toolNames.join(', ');
 
   let mode = 'auto'; // auto | required | named
   let forcedName = null;
@@ -183,28 +184,66 @@ function buildToolsSystemPrompt(tools, toolChoice) {
 
   const rule =
     mode === 'required'
-      ? 'You MUST call exactly one of the available tools. Do not answer in plain text.'
+      ? 'You MUST call exactly one of the available tools listed above. Do not answer in plain text.'
       : mode === 'named'
         ? `You MUST call the tool "${forcedName}". Do not answer in plain text. Do not call any other tool.`
-        : 'When calling a tool is appropriate, respond with ONLY the JSON object below (no surrounding text, no markdown fences). Otherwise respond normally as plain text.';
+        : 'When calling a tool is the right action, respond with ONLY the JSON object (no extra text). When the user is just chatting or you can answer directly, respond in plain text.';
+
+  // Pick a tool to use in the few-shot example: the named/required one if
+  // any, otherwise the first in the catalog. The example reuses real
+  // parameter names from the schema when possible so the model imitates
+  // a *valid* call.
+  const exampleTool = catalog.find((c) => c.name === forcedName) || catalog[0];
+  const props = exampleTool.parameters?.properties || {};
+  const exampleArgs = {};
+  for (const [k, v] of Object.entries(props).slice(0, 2)) {
+    if (v?.type === 'number' || v?.type === 'integer') exampleArgs[k] = 0;
+    else if (v?.type === 'boolean') exampleArgs[k] = false;
+    else if (v?.type === 'array') exampleArgs[k] = [];
+    else if (v?.type === 'object') exampleArgs[k] = {};
+    else exampleArgs[k] = `<${k}>`;
+  }
+  const exampleCall = `{"tool_calls":[{"name":"${exampleTool.name}","arguments":${JSON.stringify(exampleArgs)}}]}`;
 
   return [
-    'You have access to the following tools:',
-    `Available tools: ${toolNames}`,
+    `You are a tool-calling assistant. You have access to these tools and ONLY these tools: ${toolNamesList}.`,
+    'Any other tool name will be rejected as invalid.',
+    '',
     'Tool catalog (JSON-Schema):',
     JSON.stringify(catalog),
     '',
-    rule,
+    'HOW TO RESPOND',
+    `1. ${rule}`,
+    '2. When you call a tool, output EXACTLY one JSON object on a single line, with NOTHING else (no prose before or after, no markdown fences, no code blocks, no quotes around the JSON). Use this exact shape:',
+    '   {"tool_calls":[{"name":"<EXACT_NAME>","arguments":{...}}]}',
+    '3. The "arguments" object must conform to the tool\'s parameters schema.',
+    '4. Use only the EXACT tool names from the list. Never invent a name. Never abbreviate. Never translate.',
     '',
-    'When you decide to call a tool, output EXACTLY one JSON object on a single line and NOTHING else, in this exact shape:',
-    '{"tool_calls":[{"name":"TOOL_NAME","arguments":{...}}]}',
+    'EXAMPLES',
     '',
-    'Rules:',
-    '- Use only the tool names listed above. Never invent a tool name.',
-    '- The "arguments" object must conform to the tool\'s parameters schema.',
-    '- Never mix natural-language text with the JSON object in the same response.',
-    '- Never wrap the JSON in markdown fences or quotes.',
-    '- Only emit one JSON object per response.',
+    'User: Hi, how are you?',
+    'Assistant: I\'m doing well, thanks for asking!',
+    '',
+    `User: <a request that requires the "${exampleTool.name}" tool>`,
+    `Assistant: ${exampleCall}`,
+    '',
+    'CRITICAL REMINDERS',
+    `- Valid tool names: ${toolNamesList}`,
+    '- Output either plain text OR one JSON object — never both in the same response.',
+    '- Do not write "Tool call:", "Calling:", or any prefix. Just the raw JSON.',
+  ].join('\n');
+}
+
+function buildCorrectionMessage(tools, issue) {
+  const names = tools
+    .filter((t) => t && t.type === 'function' && t.function?.name)
+    .map((t) => t.function.name)
+    .join(', ');
+  return [
+    'Your previous response was not valid.',
+    `Issue: ${issue}.`,
+    `Valid tool names are exactly: ${names}.`,
+    'Try again. Output ONLY the JSON object {"tool_calls":[{"name":"<EXACT_NAME>","arguments":{...}}]} with no extra text, OR plain text if no tool is needed.',
   ].join('\n');
 }
 
@@ -345,6 +384,84 @@ function parseToolCalls(text, validNames) {
     });
   }
   return { toolCalls: normalized, leadingText: block.leadingText || '' };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Sanitización de tool-blocks tipo Continue (Plan/Agent mode)
+//
+// Continue NO usa el campo `tools` de OpenAI: mete las instrucciones de
+// herramientas dentro del `system` con un formato custom de bloques
+// ```tool TOOL_NAME: X / BEGIN_ARG: ... / END_ARG / ``` y parsea la
+// respuesta del modelo buscando esos bloques. Si el modelo se inventa
+// un TOOL_NAME que no está en el catálogo, Continue muestra
+// "Invalid Tool Call: Tool X not found". Nano alucina nombres a menudo
+// (clásico: pide `edit_file` cuando solo hay tools de lectura en Plan
+// Mode), así que aquí:
+//   1) Extraemos los nombres válidos escaneando los mensajes `system`.
+//   2) Si la respuesta contiene un bloque ```tool``` con nombre fuera
+//      de la lista, sustituimos el bloque por una nota explícita (y
+//      Continue lo mostrará como texto en vez de fallar).
+// ─────────────────────────────────────────────────────────────
+
+const TOOL_BLOCK_RE = /```tool\b([\s\S]*?)```/g;
+const TOOL_NAME_LINE_RE = /^\s*TOOL_NAME:\s*([A-Za-z_][\w\-.]*)\s*$/m;
+
+function extractToolNamesFromSystem(messages) {
+  const names = new Set();
+  const sysText = messages
+    .filter((m) => m && m.role === 'system')
+    .map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '')))
+    .join('\n\n');
+  if (!sysText) return names;
+
+  // 1) Cualquier `TOOL_NAME: x` aparecido en bloques de definición / ejemplo.
+  for (const m of sysText.matchAll(/TOOL_NAME:\s*([A-Za-z_][\w\-.]*)/g)) {
+    names.add(m[1]);
+  }
+  // 2) "Available tools: a, b, c" (lista explícita).
+  for (const m of sysText.matchAll(/Available tools:\s*([A-Za-z_][\w\-.,\s]*)/gi)) {
+    for (const n of m[1].split(/[,\n]/).map((s) => s.trim()).filter(Boolean)) {
+      if (/^[A-Za-z_][\w\-.]*$/.test(n)) names.add(n);
+    }
+  }
+  // 3) JSON catalog que inyecta el propio proxy con tools OpenAI.
+  for (const m of sysText.matchAll(/"name"\s*:\s*"([A-Za-z_][\w\-.]*)"/g)) {
+    names.add(m[1]);
+  }
+  // 4) Prosa estilo Continue: "use the X tool", "call the X tool", "the X tool",
+  //    "the X_y tool". Sólo nombres con al menos un underscore o que ya
+  //    aparezcan citados en otro patrón — para evitar capturar palabras
+  //    inglesas comunes ("the read tool") como tools válidas.
+  for (const m of sysText.matchAll(/\b(?:use|call|invoke|run)\s+the\s+([A-Za-z_][\w]*)\s+tool\b/gi)) {
+    names.add(m[1]);
+  }
+  for (const m of sysText.matchAll(/\bthe\s+([a-z_][a-z0-9_]*_[a-z0-9_]+)\s+tool\b/gi)) {
+    names.add(m[1]);
+  }
+  // 5) Listas tras conectores típicos: "Also: a, b, c.", "Other tools: ...",
+  //    "Available: ...", "Tools: ...". Los nombres deben parecer identificadores
+  //    (snake_case o con guiones), no palabras sueltas.
+  for (const m of sysText.matchAll(/\b(?:Also|Other tools|Available|Tools)\s*:\s*([A-Za-z_][\w\-.,\s]*)\.?/gi)) {
+    for (const n of m[1].split(/[,\n]/).map((s) => s.trim()).filter(Boolean)) {
+      if (/^[a-z_][a-z0-9_]*(?:[_\-][a-z0-9_]+)+$/i.test(n)) names.add(n);
+    }
+  }
+  return names;
+}
+
+function sanitizeContinueToolBlocks(text, validNames) {
+  if (!text || !validNames || !validNames.size) return { text, replaced: 0 };
+  let replaced = 0;
+  const out = text.replace(TOOL_BLOCK_RE, (full, body) => {
+    const m = body.match(TOOL_NAME_LINE_RE);
+    if (!m) return full; // no parseable; no tocamos
+    const name = m[1];
+    if (validNames.has(name)) return full; // tool válida; respetar
+    replaced++;
+    const list = [...validNames].slice(0, 12).join(', ');
+    return `_(I tried to call a tool named \`${name}\`, but it is not available. Tools I can use: ${list}. If you want me to make changes, switch Continue to Agent mode.)_`;
+  });
+  return { text: out, replaced };
 }
 
 // Detecta el "input too large" de la Prompt API (varía un poco entre builds).
@@ -696,6 +813,63 @@ async function handleChatCompletions(req, res) {
     return sendJson(res, 200, {
       id, object: 'chat.completion', created, model,
       choices: [{ index: 0, message, finish_reason }],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    });
+  }
+
+  // ── Modo "tools-en-system" (caso Continue Plan/Agent): el cliente NO
+  // mandó body.tools, pero el system describe un catálogo de herramientas
+  // con bloques ```tool TOOL_NAME: X / ... / ```. Si el modelo alucina un
+  // nombre, Continue muestra "Tool X not found". Aquí acumulamos toda la
+  // respuesta y reescribimos los bloques cuyo TOOL_NAME no esté en el
+  // catálogo detectado, para que Continue lo muestre como texto en lugar
+  // de fallar.
+  const systemToolNames = extractToolNamesFromSystem(fittedOpts.initialPrompts || []);
+  if (systemToolNames.size > 0) {
+    let text;
+    try {
+      const r = await runPromptWithFit(fittedOpts, lastForNano.content);
+      text = r.text || '';
+      if (r.trimmedCount > 0) {
+        const prev = parseInt(res.getHeader('X-Gemini-Trimmed-Messages') || '0', 10);
+        res.setHeader('X-Gemini-Trimmed-Messages', String(prev + r.trimmedCount));
+      }
+    } catch (e) {
+      if (e?.code === 'INPUT_TOO_LARGE' || isTooLargeError(e)) {
+        return sendError(res, 413, 'Input too large for Gemini Nano context, even after trimming history.', 'context_length_exceeded');
+      }
+      return sendError(res, 500, e.message, 'server_error');
+    }
+
+    const sanitized = sanitizeContinueToolBlocks(text, systemToolNames);
+    if (sanitized.replaced > 0) {
+      console.warn(`[tools-in-system] reescritos ${sanitized.replaced} bloques con nombres de tool no listados (válidos: ${[...systemToolNames].slice(0, 8).join(', ')}…)`);
+      res.setHeader('X-Gemini-Sanitized-Tool-Blocks', String(sanitized.replaced));
+    }
+
+    if (body.stream === true) {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      });
+      res.write(`data: ${JSON.stringify({
+        id, object: 'chat.completion.chunk', created, model,
+        choices: [{ index: 0, delta: { role: 'assistant', content: sanitized.text }, finish_reason: null }],
+      })}\n\n`);
+      res.write(`data: ${JSON.stringify({
+        id, object: 'chat.completion.chunk', created, model,
+        choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      })}\n\n`);
+      res.write('data: [DONE]\n\n');
+      res.end();
+      return;
+    }
+
+    return sendJson(res, 200, {
+      id, object: 'chat.completion', created, model,
+      choices: [{ index: 0, message: { role: 'assistant', content: sanitized.text }, finish_reason: 'stop' }],
       usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
     });
   }
