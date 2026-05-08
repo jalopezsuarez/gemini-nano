@@ -10,6 +10,10 @@ Por debajo, el proxy pilota una pestaña de **Chrome Canary** vía CDP
 (Chrome DevTools Protocol). Es Nano real, ejecutado por Chromium, no una
 emulación. Todo on-device.
 
+**Funciona en macOS, Linux y Windows** — un único `run.py` orquesta el
+arranque y se adapta al SO automáticamente (binario de Canary, ruta del
+perfil, atajos de copia, logs).
+
 **Funcionalidades destacadas:**
 
 - API OpenAI-compatible (`/v1/chat/completions`, `/v1/models`, `/health`),
@@ -34,44 +38,22 @@ emulación. Todo on-device.
 - **Headers de telemetría**: `X-Gemini-Trimmed-Messages`,
   `X-Gemini-Sanitized-Tool-Blocks`, `X-Gemini-Delegation-Retry`.
 
-## Cómo está montado
+## Cómo empezar
 
-```
-Cliente OpenAI               proxy Node                    Chrome Canary
-(curl / SDK / Cursor)        node openai-proxy.js          con LanguageModel
-        │                            │                            │
-        │  POST /v1/chat/completions │                            │
-        │ ──────────────────────────▶│                            │
-        │  (stream + no-stream)      │  CDP via WS :9222          │
-        │                            │ ─────────────────────────▶ │
-        │                            │  Runtime.evaluate(         │
-        │                            │    LanguageModel.create() ·│
-        │                            │    .promptStreaming(...))  │
-        │                            │ ◀─ chunks via console.log  │
-        │ ◀──── SSE chunks ──────────│                            │
-```
-
-## Requisitos
-
-- **macOS, Linux o Windows.** En macOS aprovechamos `cp -cR` (APFS clone)
-  para clonar el perfil de Canary en ~0 bytes; en Linux con btrfs/xfs
-  usamos `cp --reflink=auto`; en Windows o si reflink no aplica, copia
-  recursiva normal.
-- **Chrome Canary** + modelo Gemini Nano descargado (ver siguiente sección).
-  En Linux es `google-chrome-unstable`; en Windows
-  `%LOCALAPPDATA%\Google\Chrome SxS\Application\chrome.exe`.
-- **Node 18+** (para `fetch` nativo y la dependencia `ws`).
-- **Python 3.9+** (para `run.py` y, opcionalmente, el chat web).
-
-## Setup de Chrome Canary y Gemini Nano
+Antes de tocar el proxy, necesitas Chrome Canary con el modelo Gemini Nano
+descargado. Estos son los cuatro pasos para tenerlo listo desde cero (la
+parte de instalar este repo viene después, en *Instalación del proyecto*).
 
 ### 1. Descarga Chrome Canary
 
-```bash
-open https://www.google.com/chrome/canary/
-```
+Desde [google.com/chrome/canary](https://www.google.com/chrome/canary/).
+Convive sin problemas con tu Chrome estable.
 
-Instálalo en `/Applications/`. Convive sin problemas con tu Chrome estable.
+| SO | Notas de instalación |
+|---|---|
+| macOS | Arrastra a `/Applications/`. |
+| Linux | Paquete `.deb` / `.rpm` instala como `google-chrome-unstable`. |
+| Windows | Instalador estándar; queda en `%LOCALAPPDATA%\Google\Chrome SxS\…`. |
 
 ### 2. Activa los flags
 
@@ -85,7 +67,20 @@ Pulsa el botón azul **Relaunch** abajo.
 
 ### 3. Dispara la descarga del modelo (~4 GB)
 
-Abre cualquier pestaña, `Cmd+Opt+I` para DevTools → pestaña **Console**, y ejecuta:
+Abre cualquier pestaña, abre DevTools → pestaña **Console**:
+
+| SO | Atajo de DevTools |
+|---|---|
+| macOS | `Cmd+Opt+I` (o `Fn+F12` en teclados con fila F como funciones secundarias) |
+| Linux / Windows | `F12` (o `Ctrl+Shift+I`) |
+
+> 🛑 **Antes de pegar nada**, escribe literalmente `allow pasting` y pulsa
+> Enter en la Console. Chrome bloquea el primer paste en la Console por
+> seguridad ("Warning: Don't paste code…"); este comando habilita el paste
+> para esa sesión. Si no lo haces, los snippets de abajo se quedan en el
+> prompt sin ejecutarse.
+
+Una vez habilitado, ejecuta:
 
 ```js
 await LanguageModel.availability()
@@ -97,7 +92,7 @@ await LanguageModel.availability()
 | `"downloadable"` | Listo para bajar, no se ha pedido | Sigue abajo |
 | `"downloading"` | Bajando ahora mismo | Espera |
 | `"unavailable"` | No cumple requisitos | Verifica los flags y reinicia Canary |
-| `LanguageModel is not defined` | Flags no aplicados | Reinicia Canary del todo (Cmd+Q) |
+| `LanguageModel is not defined` | Flags no aplicados | Reinicia Canary del todo (`Cmd+Q` / cerrar todas las ventanas / `Alt+F4`) |
 
 Si fue `"downloadable"`, fuerza la descarga ejecutando:
 
@@ -130,33 +125,72 @@ Si funciona aquí, **funciona en el proxy**.
 
 Requisitos reales del modelo (Google los exige aunque pongas BypassPerfRequirement):
 
-- macOS 13+, **22 GB libres** en el disco del perfil de Chrome.
+- **macOS 13+ / Windows 10+ / Linux con kernel reciente.**
+- **22 GB libres** en el disco del perfil de Chrome.
 - GPU con ≥4 GB VRAM (Apple Silicon vale).
 - Conexión no medida (Chrome detecta tethering y se niega).
 - Idioma del perfil de Chrome preferiblemente **inglés** (`chrome://settings/languages` → *English (United States)* arriba del todo, reinicia).
 
+## Cómo está montado
+
+```
+Cliente OpenAI               proxy Node                    Chrome Canary
+(curl / SDK / Cursor)        node openai-proxy.js          con LanguageModel
+        │                            │                            │
+        │  POST /v1/chat/completions │                            │
+        │ ──────────────────────────▶│                            │
+        │  (stream + no-stream)      │  CDP via WS :9222          │
+        │                            │ ─────────────────────────▶ │
+        │                            │  Runtime.evaluate(         │
+        │                            │    LanguageModel.create() ·│
+        │                            │    .promptStreaming(...))  │
+        │                            │ ◀─ chunks via console.log  │
+        │ ◀──── SSE chunks ──────────│                            │
+```
+
+## Requisitos
+
+- **macOS, Linux o Windows.**
+  - macOS: `cp -cR` (APFS clone) clona el perfil de Canary en ~0 bytes.
+  - Linux con btrfs/xfs: `cp --reflink=auto` (también ~0 bytes).
+  - Windows / cualquier FS sin reflink: copia recursiva normal con
+    `shutil.copytree`.
+- **Chrome Canary** + modelo Gemini Nano descargado (paso *Cómo empezar*
+  más arriba). Rutas por defecto:
+  - macOS: `/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary`
+  - Linux: `google-chrome-unstable` en el `PATH` (también acepta
+    `google-chrome-canary`, `chromium-browser-unstable`, `google-chrome`,
+    `chromium`).
+  - Windows: `%LOCALAPPDATA%\Google\Chrome SxS\Application\chrome.exe`
+    (también busca en `Program Files [(x86)]\Google\Chrome SxS\…`).
+- **Node 18+** (para `fetch` nativo y la dependencia `ws`).
+- **Python 3.9+** (para `run.py` y, opcionalmente, el chat web).
+
+> Si tu Canary está en otra ruta, define `CANARY_BIN` antes de lanzar
+> `run.py`. Si tu perfil está en otra ubicación, define `SOURCE_PROFILE`.
+
 ## Instalación del proyecto
 
 > Antes de esto, asegúrate de tener Canary con Nano descargado siguiendo
-> la sección **Setup de Chrome Canary y Gemini Nano** de arriba.
+> la sección **Cómo empezar** de arriba.
 
 ```bash
-git clone <este-repo>
-cd GeminiLanguageModel
-chmod +x run.py  # por si no es ejecutable (POSIX)
+git clone https://github.com/jalopezsuarez/gemini-nano.git
+cd gemini-nano
+```
+
+En **macOS / Linux**, marca el launcher como ejecutable (en Windows no
+hace falta — se invoca con `python`):
+
+```bash
+chmod +x run.py
 ```
 
 > `run.py` instala las dependencias npm (solo `ws`) automáticamente la
 > primera vez que lo ejecutas si no existe `node_modules/`. Si prefieres
 > hacerlo a mano, lanza `npm install` antes.
->
-> Multiplataforma: `run.py` corre en macOS, Linux y Windows. Detecta
-> automáticamente Canary y el perfil de origen según el SO; puedes
-> sobreescribirlos con las variables de entorno `CANARY_BIN` y
-> `SOURCE_PROFILE`. En Windows usa `python run.py` (los logs van a
-> `%TEMP%` en vez de `/tmp/`).
 
-Edita `web/llm.json` si quieres cambiar el `systemPrompt`, `temperature`,
+Edita `app.json` si quieres cambiar el `systemPrompt`, `temperature`,
 `maxTokens` o `apiKey` (cualquier string vale, el proxy no la valida):
 
 ```json
@@ -182,23 +216,23 @@ Edita `web/llm.json` si quieres cambiar el `systemPrompt`, `temperature`,
 
 ### Una sola línea
 
-```bash
-./run.py            # macOS / Linux
-python run.py       # Windows
-```
+| SO | Comando |
+|---|---|
+| macOS / Linux | `./run.py` |
+| Windows (PowerShell o CMD) | `python run.py` |
 
 Lanza **todo** y abre el chat en tu navegador:
 
 1. **Clona** tu perfil de Canary a `~/.canary-debug-profile` la primera vez (APFS clone en mac, reflink en Linux si está disponible, copia normal en Windows).
 2. **Instala dependencias npm** (solo `ws`) si aún no existe `node_modules/`.
-3. **Mata** instancias previas del setup (no toca tu Canary normal).
+3. **Mata** instancias previas del setup (no toca tu Canary normal). En POSIX usa `pkill -f`; en Windows itera `Win32_Process` por PowerShell.
 4. **Lanza Canary headless** con `--remote-debugging-port=9222 --remote-allow-origins=* --headless=new`.
 5. **Arranca el proxy Node** en `:8765` (OpenAI-compatible).
 6. **Arranca el chat web Python** en `:8001`.
 7. **Abre tu navegador** en `http://localhost:8001`.
 8. **Ctrl+C** mata las tres cosas a la vez.
 
-Flags de línea de comando:
+Flags de línea de comando (idénticos en los tres SO):
 
 ```bash
 ./run.py --server     # solo LLM (Canary + proxy), sin chat web Python
@@ -206,6 +240,9 @@ Flags de línea de comando:
 ./run.py --server --ethernet   # ambos: proxy LAN-accesible, sin chat
 ./run.py --help       # ayuda
 ```
+
+> En Windows sustituye `./run.py` por `python run.py` en todos los
+> ejemplos de esta sección.
 
 Alias aceptados: `--server` también `-s` / `--no-chat`; `--ethernet` también
 `--lan` / `--all` / `-e`.
@@ -215,9 +252,11 @@ Cuando bindeas a la LAN, el script detecta tu IP local (truco
 imprime junto a las URLs (`http://10.x.x.x:8765/v1`,
 `http://10.x.x.x:8001`). El chat web reescribe automáticamente el host del
 `baseURL` del proxy a `location.hostname` cuando se accede desde una IP no
-loopback, así funciona desde otros dispositivos sin tocar `llm.json`.
+loopback, así funciona desde otros dispositivos sin tocar `app.json`.
 
-Variables de entorno opcionales:
+Variables de entorno opcionales (mismas en macOS, Linux y Windows; en
+PowerShell define con `$env:NOMBRE = "valor"`, en CMD con
+`set NOMBRE=valor`):
 
 ```bash
 PORT=8000 CDP_PORT=9333 CHAT_PORT=9000 ./run.py   # otros puertos
@@ -228,6 +267,13 @@ SERVE_CHAT=0     ./run.py   # equivalente a --server
 CANARY_BIN=/path/to/chrome ./run.py     # binario de Canary explícito
 SOURCE_PROFILE=/path/to/profile ./run.py # perfil de origen a clonar
 ```
+
+Logs (los crea `run.py` automáticamente):
+
+| SO | Ubicación |
+|---|---|
+| macOS / Linux | `/tmp/canary.log`, `/tmp/proxy.log`, `/tmp/chat.log` |
+| Windows | `%TEMP%\canary.log`, `%TEMP%\proxy.log`, `%TEMP%\chat.log` |
 
 ### Endpoints
 
@@ -240,6 +286,10 @@ SOURCE_PROFILE=/path/to/profile ./run.py # perfil de origen a clonar
 Headers OpenAI estándar respetados. CORS abierto (`*`) para clientes web.
 
 ### Ejemplo (curl)
+
+> En Windows usa `curl.exe` (incluido en Windows 10+) o sustituye `\` de
+> continuación de línea por backtick `` ` `` en PowerShell, o por `^` en
+> CMD. El cuerpo JSON es idéntico.
 
 ```bash
 curl http://localhost:8765/v1/chat/completions \
@@ -362,16 +412,21 @@ for await (const chunk of stream) process.stdout.write(chunk.choices[0]?.delta?.
 
 ## Cliente web tipo ChatGPT
 
-`web/web.py` levanta un mini servidor HTTP que sirve un único HTML con
+`app.py` levanta un mini servidor HTTP que sirve un único HTML con
 estética ChatGPT (oscura) y consume el proxy. Vanilla, sin frameworks.
 
 ```bash
-python3 web/web.py            # http://localhost:8001
-PORT=8080 python3 web/web.py  # otro puerto
+python3 app.py            # macOS / Linux  →  http://localhost:8001
+python app.py             # Windows
+PORT=8080 python3 app.py  # otro puerto (POSIX)
 ```
 
-Lee la configuración de `web/llm.json` (también acepta `./llm.json` en el
-cwd o un path en `$LLM_CONFIG`):
+> En Windows, para definir el puerto en una sola línea:
+> `set PORT=8080 && python app.py` (CMD) o
+> `$env:PORT=8080; python app.py` (PowerShell).
+
+Lee la configuración de `app.json` (también acepta un path en
+`$LLM_CONFIG`):
 
 ```json
 {
@@ -397,7 +452,7 @@ Características:
 - Ajustes (system prompt, temperatura, max tokens) persistidos en `localStorage`.
 - Indicador de estado del proxy (verde/amarillo/rojo) con autoping cada 10 s
   y métrica **tok/s** en vivo durante la generación (estimación ~4 chars/token).
-- **Reverse-proxy integrado**: `web.py` reenvía `/v1/*` y `/health` al proxy
+- **Reverse-proxy integrado**: `app.py` reenvía `/v1/*` y `/health` al proxy
   local (`UPSTREAM_PROXY`, por defecto derivado de `baseURL`). Esto permite
   exponer un único host (LAN, ngrok, Tailscale…) y que el navegador hable
   same-origin, sin CORS ni puertos extra. El cliente reescribe automáticamente
@@ -409,12 +464,9 @@ Características:
 .
 ├── openai-proxy.js   # proxy HTTP ↔ CDP (Node)
 ├── run.py            # launcher multiplataforma: Canary headless + proxy + chat web
-├── web/
-│   ├── web.py         # cliente web ChatGPT-style (Python + HTML/CSS/JS)
-│   └── llm.json       # config compartida (baseURL, model, etc.)
-├── test/
-│   └── test.py        # copia de web/web.py (sandbox para experimentar)
-├── package.json       # única dep: ws
+├── app.py            # cliente web ChatGPT-style (Python + HTML/CSS/JS)
+├── app.json          # config compartida (baseURL, model, etc.)
+├── package.json      # única dep: ws
 └── README.md
 ```
 
@@ -432,8 +484,9 @@ JavaScript dentro de una pestaña de Chrome. Esto es lo que hace el proxy:
    sobre un perfil aislado clonado del real (para evitar el bloqueo de
    remote-debugging en perfiles con Google Sync).
 2. Abre una pestaña en `file:///tmp/gemini-nano-proxy-host.html` (un HTML
-   mínimo escrito por el propio proxy). `file://` es contexto seguro en
-   Chrome, así que `LanguageModel` se expone igual que en HTTPS.
+   mínimo escrito por el propio proxy; en Windows va a `%TEMP%`).
+   `file://` es contexto seguro en Chrome, así que `LanguageModel` se
+   expone igual que en HTTPS.
 3. Por cada `POST /v1/chat/completions`, evalúa vía CDP:
    ```js
    const s = await LanguageModel.create({ ...opts, initialPrompts: [...] });
@@ -447,12 +500,12 @@ JavaScript dentro de una pestaña de Chrome. Esto es lo que hace el proxy:
 
 | Síntoma | Causa probable | Fix |
 |---|---|---|
-| `✗ Chrome Canary no encontrado en …` | Canary instalado en una ruta no estándar | Define `CANARY_BIN=/ruta/a/chrome` antes de `run.py` |
-| `✗ Canary no abrió :9222` | Tu Canary normal interfiere o el flag se ignora | `pkill -f "Google Chrome Canary"` (POSIX) o cierra Canary y vuelve a lanzar `run.py` |
+| `✗ Chrome Canary no encontrado en …` | Canary instalado en una ruta no estándar | Define `CANARY_BIN=/ruta/a/chrome` antes de `run.py` (en Windows: `set CANARY_BIN=C:\…\chrome.exe`) |
+| `✗ Canary no abrió :9222` | Tu Canary normal interfiere o el flag se ignora | Cierra Canary y vuelve a lanzar `run.py`. Atajos para matarlo a mano: `pkill -f "Google Chrome Canary"` (macOS/Linux) o `taskkill /F /IM chrome.exe` (Windows) |
 | `CDP no disponible: 403` | Falta `--remote-allow-origins=*` | Mata Canary y relanza con `run.py` (ya lo incluye) |
 | `LanguageModel is not defined` (en proxy) | Pestaña en `about:blank` o sin contexto seguro | El proxy abre `file://...host.html` automáticamente; si no, comprueba `chrome://components` |
 | `NotSupportedError: requested language` | Idioma no soportado por Nano | Pasar siempre `en`; añade *"Always answer in Spanish"* al system prompt |
-| Chat web "proxy no responde" (rojo) | Proxy parado o Canary cayó | Vuelve a lanzar `./run.py` |
+| Chat web "proxy no responde" (rojo) | Proxy parado o Canary cayó | Vuelve a lanzar `./run.py` (POSIX) o `python run.py` (Windows) |
 | Continue / Cursor: `API_KEY_INVALID` de `googleapis.com` | `provider: gemini` ignora `apiBase` | Usa `provider: openai` (ver sección de Continue) |
 | `The input is too large.` / 413 `context_length_exceeded` | El prompt + historia excede los ~6k tokens de Nano | El proxy ya recorta historia automáticamente (ver *Auto-trim*); si el último user solo ya excede, reduce el prompt o `defaultCompletionOptions.contextLength` en Continue |
 | Continue Agent (`tools=[]`): `Invalid Tool Call: Tool X not found` | Nano alucinó un nombre de tool fuera del catálogo | El proxy ya descarta los nombres no válidos y devuelve texto plano (ver *Tool calling emulado*); para Agent real, usa otro modelo y deja Nano en modo Chat |
@@ -471,7 +524,7 @@ JavaScript dentro de una pestaña de Chrome. Esto es lo que hace el proxy:
   largas pueden saturar y cortar. El proxy mitiga esto con **auto-trim**
   (ver siguiente apartado).
 - **Si pierdes el debugger** (cierras Canary, cambias de red…), reejecuta
-  `./run.py`.
+  el launcher (`./run.py` en POSIX, `python run.py` en Windows).
 - **Sin telemetría de tokens**: los campos `usage.*` en la respuesta van a
   cero porque la API de Chrome no expone tokens consumidos en formato
   comparable a OpenAI.

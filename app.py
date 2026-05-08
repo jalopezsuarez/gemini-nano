@@ -2,8 +2,8 @@
 """Chat web (estética ChatGPT) que consume el proxy OpenAI-compatible de Gemini Nano.
 
 Uso:
-    python3 chat.py            # sirve en http://localhost:8001
-    PORT=8080 python3 chat.py  # otro puerto
+    python3 app.py            # sirve en http://localhost:8001
+    PORT=8080 python3 app.py  # otro puerto
 
 No requiere dependencias. El streaming lo hace el JS del navegador via SSE
 parsing de la respuesta del proxy en http://localhost:8765/v1/chat/completions.
@@ -22,12 +22,11 @@ from urllib.parse import urlparse
 PORT = int(os.environ.get("PORT", "8001"))
 HOST = os.environ.get("HOST", "127.0.0.1")
 
-# Carga config desde llm.json (la misma que usa test/chat.swift).
+# Carga config desde app.json.
 # Orden de búsqueda:
 #   1. $LLM_CONFIG (ruta absoluta)
-#   2. ../test/llm.json relativo a este script
-#   3. ./test/llm.json relativo al cwd
-#   4. ./llm.json relativo al cwd
+#   2. ./app.json relativo a este script
+#   3. ./app.json relativo al cwd
 HERE = Path(__file__).resolve().parent
 
 def find_config() -> Path:
@@ -35,15 +34,14 @@ def find_config() -> Path:
     if env := os.environ.get("LLM_CONFIG"):
         candidates.append(Path(env))
     candidates += [
-        HERE / "llm.json",
-        Path.cwd() / "llm.json",
-        Path.cwd() / "web" / "llm.json",
+        HERE / "app.json",
+        Path.cwd() / "app.json",
     ]
     for p in candidates:
         if p.is_file():
             return p
     raise SystemExit(
-        "No se encuentra llm.json. Buscado en:\n  - " +
+        "No se encuentra app.json. Buscado en:\n  - " +
         "\n  - ".join(str(c) for c in candidates) +
         "\nUsa $LLM_CONFIG para indicar una ruta concreta."
     )
@@ -52,7 +50,7 @@ CONFIG_PATH = find_config()
 try:
     CONFIG = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
 except json.JSONDecodeError as e:
-    raise SystemExit(f"llm.json inválido ({CONFIG_PATH}): {e}")
+    raise SystemExit(f"app.json inválido ({CONFIG_PATH}): {e}")
 
 # Defaults defensivos por si el JSON omite campos opcionales.
 CONFIG.setdefault("systemPrompt", "")
@@ -60,7 +58,7 @@ CONFIG.setdefault("temperature", 0.7)
 CONFIG.setdefault("maxTokens", 1024)
 CONFIG.setdefault("timeoutSeconds", 60)
 
-# Upstream del proxy local: por defecto se deriva del baseURL del llm.json
+# Upstream del proxy local: por defecto se deriva del baseURL del app.json
 # (host:puerto, sin path). Se puede sobreescribir con $UPSTREAM_PROXY.
 def _derive_upstream(base_url: str) -> str:
     u = urlparse(base_url)
@@ -71,7 +69,7 @@ def _derive_upstream(base_url: str) -> str:
 UPSTREAM = os.environ.get("UPSTREAM_PROXY") or _derive_upstream(CONFIG["baseURL"])
 PROXY_TIMEOUT = float(CONFIG.get("timeoutSeconds", 60))
 
-# El navegador habla *siempre* en mismo-origen: web.py reenvía /v1/* y /health
+# El navegador habla *siempre* en mismo-origen: app.py reenvía /v1/* y /health
 # al proxy local. Así un único host expuesto (LAN, ngrok, Tailscale…) basta.
 BROWSER_CONFIG = dict(CONFIG)
 BROWSER_CONFIG["baseURL"] = "/v1/"
@@ -325,7 +323,7 @@ const CONFIG = $$CONFIG$$;
 // Si la página se sirve desde una IP/host distinto de localhost (p.ej. LAN),
 // reescribimos el host del baseURL del proxy para que apunte al mismo origen.
 // Así funciona igual desde http://localhost:8001 que desde http://10.x.x.x:8001
-// sin tener que tocar llm.json.
+// sin tener que tocar app.json.
 try {
   const u = new URL(CONFIG.baseURL, window.location.href);
   const isLocal = (h) => h === 'localhost' || h === '127.0.0.1' || h === '::1';

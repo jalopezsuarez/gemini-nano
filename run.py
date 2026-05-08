@@ -199,8 +199,7 @@ if not (PROJECT_DIR / "node_modules").is_dir():
 for pattern in (
     f"--user-data-dir={PROFILE}",
     "openai-proxy.js",
-    "web/web.py",
-    "web\\web.py",
+    "app.py",
 ):
     kill_pattern(pattern)
 time.sleep(1)
@@ -313,7 +312,7 @@ if SERVE_CHAT:
     chat_env = os.environ.copy()
     chat_env.update({"PORT": str(CHAT_PORT), "HOST": BIND_HOST})
     procs["chat"] = spawn(
-        [sys.executable, "-u", str(PROJECT_DIR / "web" / "web.py")],
+        [sys.executable, "-u", str(PROJECT_DIR / "app.py")],
         LOG_DIR / "chat.log",
         env=chat_env,
     )
